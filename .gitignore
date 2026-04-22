@@ -1,0 +1,28 @@
+# Secrets and local runtime state
+config.yaml
+config.local.yaml
+config.*.yaml
+!config.example.yaml
+*.log
+*.pid
+
+# Build outputs
+bin/
+dist/
+coverage.out
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Downloaded toolchains and caches
+.tools/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Go workspace noise
+vendor/

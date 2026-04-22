@@ -1,0 +1,32 @@
+server:
+  listen: 127.0.0.1:46321
+  public_base_url: http://127.0.0.1:46321
+  log_level: info
+  log_format: console
+  request_timeout: 8m
+  acquire_timeout: 45s
+  min_interval: 60s
+  cooldown_429: 10m
+  blob_ttl: 20m
+  max_image_bytes: 16777216
+
+auth:
+  api_keys:
+    - sakura-sidecar-key
+
+models:
+  - id: gpt-image-2
+    upstream: auto
+    type: image
+  - id: gpt-image-1
+    upstream: auto
+    type: image
+
+accounts:
+  - name: primary
+    auth_token: ""
+    device_id: ""
+    session_id: ""
+    proxy_url: ""
+    cookies: ""
+    enabled: true

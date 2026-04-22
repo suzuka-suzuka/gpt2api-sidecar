@@ -1,0 +1,18 @@
+[Unit]
+Description=gpt2api-sidecar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sakura
+Group=sakura
+WorkingDirectory=/opt/gpt2api-sidecar
+ExecStart=/opt/gpt2api-sidecar/bin/gpt2api-sidecar -config /opt/gpt2api-sidecar/config.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
