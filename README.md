@@ -1,14 +1,25 @@
 # gpt2api-sidecar
 
-A lightweight Go image sidecar that keeps the reverse-engineered `chatgpt.com` image pipeline, while exposing a small OpenAI-compatible API for local projects like Sakura.
+一个轻量的 Go 图片 sidecar。
 
-This repository is intentionally small. It does not include the full SaaS layers from the upstream `gpt2api` project such as MySQL, Redis, billing, admin UI, account management, or RBAC. It focuses on one job:
+它保留了 `chatgpt.com` 图片链路里最关键的逆向部分，同时对下游暴露一个小而实用的 OpenAI 兼容接口，方便像 Sakura 这样的项目直接接入。
 
-- keep the Go reverse layer
-- expose `/v1/images/*` in an OpenAI-compatible shape
-- return real image bytes that downstream apps can send directly
+这个仓库是刻意“瘦身”过的版本，不包含上游 `gpt2api` 里的完整 SaaS 层，例如：
 
-## What It Provides
+- MySQL
+- Redis
+- 计费
+- 管理后台
+- 账号管理面板
+- RBAC 权限系统
+
+它只专注做一件事：
+
+- 保留 Go 逆向层
+- 提供 `/v1/images/*` 的 OpenAI 兼容接口
+- 返回真实图片字节，方便下游直接发送
+
+## 当前提供的接口
 
 - `GET /healthz`
 - `GET /v1/models`
@@ -16,117 +27,137 @@ This repository is intentionally small. It does not include the full SaaS layers
 - `POST /v1/images/edits`
 - `GET /v1/blobs/:id`
 - `POST /v1/chat/completions`
-  - currently returns `501` because this sidecar is image-only for now
+  - 当前固定返回 `501`，因为这个 sidecar 暂时只做图片能力
 
-## Why This Exists
+## 这个项目的定位
 
-The upstream `gpt2api` project contains several layers mixed together:
+上游 `gpt2api` 仓库把三层东西放在了一起：
 
-- reverse-engineered ChatGPT upstream client
-- OpenAI-compatible gateway
-- SaaS platform features
+- ChatGPT 网页逆向客户端
+- OpenAI 兼容网关
+- SaaS 平台能力
 
-For integration into existing bots or plugins, that full stack is often unnecessary. This sidecar extracts the practical core for image generation and image editing, while staying easy to deploy beside another application.
+但如果你只是想把图片能力接进自己的机器人、插件或本地服务，完整 SaaS 栈通常太重了。
 
-## Reverse Layer Kept Here
+这个 sidecar 就是把“最有复用价值”的那层单独抽出来，变成一个能陪跑在你主项目旁边的小服务。
 
-The sidecar still uses the important parts of the upstream reverse stack:
+## 保留了哪些逆向能力
 
-- `uTLS` transport and browser-like TLS fingerprinting
+当前 sidecar 仍然保留这些关键部分：
+
+- `uTLS` 传输层和浏览器风格 TLS 指纹
 - `sentinel/chat-requirements`
-- PoW token flow
+- PoW 流程
 - `/f/conversation`
-- reference image upload
-- conversation polling
-- signed image download resolution
+- 参考图上传
+- 会话轮询
+- 图片下载签名 URL 解析
 
-## Repository Layout
+## 目录结构
 
 - `cmd/sidecar`
-  - executable entrypoint
+  - 程序入口
 - `internal/server`
-  - HTTP API and OpenAI-compatible response layer
+  - HTTP API 和 OpenAI 兼容响应层
 - `internal/runner`
-  - image workflow orchestration
+  - 图片流程编排
 - `internal/pool`
-  - in-memory account pool
+  - 内存版账号池
 - `internal/upstream/chatgpt`
-  - copied and adapted reverse client pieces
+  - 复制并裁剪过的逆向客户端代码
 - `scripts`
-  - helper scripts for Windows and Linux
+  - Windows / Linux 启动与构建脚本
 - `deploy/systemd`
-  - example service file for Linux
+  - Linux 的 `systemd` 示例
 
-## Configuration
+## 配置说明
 
-Copy the example file first:
+先复制示例配置：
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-Required fields:
+必须填写的字段：
 
 - `auth.api_keys`
-  - API keys that downstream clients use to call this sidecar
+  - 下游调用这个 sidecar 时使用的 API Key
 - `accounts[].auth_token`
-  - ChatGPT web access token used by the reverse upstream client
+  - ChatGPT 网页侧的 `access_token`
 - `accounts[].proxy_url`
-  - optional, but required if your account must reach `chatgpt.com` through a proxy
+  - 可选；如果你的账号必须走代理访问 `chatgpt.com`，这里要填
 
-If `device_id` and `session_id` are empty on first start, the sidecar generates them and persists them back to `config.yaml` to keep account fingerprinting stable.
+如果 `device_id` 和 `session_id` 为空，sidecar 首次启动时会自动生成，并回写到 `config.yaml`，用来保持账号指纹稳定。
 
-## Quick Start
+## 下载安装后怎么启动
 
 ### Windows
 
+如果你已经把仓库下载下来了，最直接就是：
+
 ```powershell
 Copy-Item .\config.example.yaml .\config.yaml
+```
+
+然后编辑 `config.yaml`，至少填好：
+
+- `accounts[0].auth_token`
+- 如果需要代理，再填 `accounts[0].proxy_url`
+
+接着启动：
+
+```powershell
 .\scripts\run.ps1
 ```
 
-What `run.ps1` does:
+`run.ps1` 会自动做这些事：
 
-- creates `config.yaml` if missing
-- refuses to start if `auth_token` is empty
-- downloads portable Go into `.tools\go` if `go` is not installed
-- runs `go mod tidy`
-- starts the sidecar
+- 如果没有 `config.yaml`，就从 `config.example.yaml` 复制一份
+- 如果 `auth_token` 还是空的，就直接提示你，不会盲启动
+- 如果本机没装 Go，就下载便携 Go 到 `.tools\go`
+- 自动执行 `go mod tidy`
+- 启动 sidecar
+
+如果你想先编译再运行：
+
+```powershell
+.\scripts\build.ps1
+.\bin\gpt2api-sidecar.exe -config .\config.yaml
+```
 
 ### Linux
 
-See [LINUX.md](./LINUX.md) for the full Linux guide.
+完整说明见 [LINUX.md](./LINUX.md)。
 
-Quick version:
+最短启动方式：
 
 ```bash
 chmod +x ./scripts/run.sh ./scripts/build.sh
 ./scripts/run.sh
 ```
 
-## Build
-
-### Windows
-
-```powershell
-.\scripts\build.ps1
-```
-
-### Linux
+如果你想先编译：
 
 ```bash
 ./scripts/build.sh
+./bin/gpt2api-sidecar -config ./config.yaml
 ```
 
-The compiled binary is written to:
+## 默认监听地址
+
+```text
+http://127.0.0.1:46321
+```
+
+编译后的 Linux 二进制默认输出到：
 
 ```text
 ./bin/gpt2api-sidecar
 ```
 
-## Example Sakura Integration
+## Sakura 接入示例
 
-Point the Sakura image config to this sidecar:
+把 Sakura 的图片配置指向这个 sidecar：
 
 ```yaml
 provider: openai_compat
@@ -135,12 +166,12 @@ api: sakura-sidecar-key
 baseURL: http://127.0.0.1:46321/v1
 ```
 
-If Sakura runs on a different machine, replace `127.0.0.1` with your sidecar host IP or domain, and update:
+如果 Sakura 和 sidecar 不在同一台机器上，把 `127.0.0.1` 改成 sidecar 所在机器的 IP 或域名，同时修改：
 
 - `server.listen`
 - `server.public_base_url`
 
-## Health Checks
+## 健康检查
 
 ```bash
 curl http://127.0.0.1:46321/healthz
@@ -148,19 +179,19 @@ curl http://127.0.0.1:46321/v1/models \
   -H "Authorization: Bearer sakura-sidecar-key"
 ```
 
-## Notes and Limits
+## 当前边界
 
-- this sidecar is image-only for now
-- `POST /v1/chat/completions` still returns `501`
-- changing `config.yaml` values such as `models`, `api_keys`, or `accounts` requires a restart
-- config hot reload is not implemented
+- 目前只做图片接口
+- `POST /v1/chat/completions` 仍然返回 `501`
+- 修改 `config.yaml` 里的 `models`、`api_keys`、`accounts` 后，需要重启 sidecar
+- 当前没有实现配置热重载
 
-## Security Notes
+## 安全提示
 
-- do not commit `config.yaml`
-- do not commit real ChatGPT `auth_token` values
-- use `config.example.yaml` as the public template
+- 不要提交 `config.yaml`
+- 不要提交真实的 ChatGPT `auth_token`
+- 对外公开仓库时只保留 `config.example.yaml`
 
-## Credits
+## 致谢
 
-This project is derived from the reverse and gateway ideas in the upstream `gpt2api` project, but intentionally stripped down into a focused sidecar for integration use cases.
+这个项目的思路与部分逆向实现来源于上游 `gpt2api`，这里只是把它裁成了一个更适合集成场景的轻量 sidecar。
