@@ -2,17 +2,16 @@
 //
 // 完整链路(和文字聊天共用 f/conversation,只通过 system_hints=["picture_v2"] 区分):
 //
-//	0. (可选) GET /                              → 拿 oai-did cookie
-//	1. POST /backend-api/f/conversation/prepare      → conduit_token(灰度分桶关键)
-//	2. POST /backend-api/sentinel/chat-requirements → chat_token + 可选 POW 挑战
-//	3. POST /backend-api/f/conversation (SSE)         → 边解析边收 file-service://
-//	4. 灰度命中判据:SSE 没直出 file-service 时轮询
-//	   GET /backend-api/conversation/{id}
-//	   - IMG2 tool 消息 ≥ 2 条 → 灰度命中,取最新那条
-//	   - 只 1 条 → preview_only(非灰度,换账号重试)
-//	5. GET /backend-api/files/{fid}/download                   → 签名 URL(file-service)
-//	   GET /backend-api/conversation/{cid}/attachment/{sid}/download → 签名 URL(sediment)
-//	6. GET 签名 URL → 图片字节
+//  0. (可选) GET /                              → 拿 oai-did cookie
+//  1. POST /backend-api/f/conversation/prepare      → conduit_token
+//  2. POST /backend-api/sentinel/chat-requirements → chat_token + 可选 POW 挑战
+//  3. POST /backend-api/f/conversation (SSE)         → 边解析边收 file-service://
+//  4. SSE 没直出 file-service 时轮询 GET /backend-api/conversation/{id}
+//     任何一条 tool 消息出现 file-service / sediment asset_pointer 即算成功,
+//     够 N 张立即返回;IMG2 已正式上线,不再做"灰度命中判定"。
+//  5. GET /backend-api/files/{fid}/download                   → 签名 URL(file-service)
+//     GET /backend-api/conversation/{cid}/attachment/{sid}/download → 签名 URL(sediment)
+//  6. GET 签名 URL → 图片字节
 //
 // 注意:不要调用 /backend-api/conversation/init——这是老客户端路径,在免费账号上会
 // 直接 404 让整条链路失败,上游把 picture_v2 路由完全交给 f/conversation 的 payload。
@@ -374,14 +373,14 @@ func ParseImageSSE(stream <-chan SSEEvent) ImageSSEResult {
 
 // ImageToolMsg 是 conversation.mapping 里一条 IMG2 tool 消息的关键字段。
 type ImageToolMsg struct {
-	MessageID    string
-	CreateTime   float64
-	ModelSlug    string
-	Recipient    string
-	AuthorName   string
+	MessageID     string
+	CreateTime    float64
+	ModelSlug     string
+	Recipient     string
+	AuthorName    string
 	ImageGenTitle string
-	FileIDs      []string // file-service
-	SedimentIDs  []string // sediment
+	FileIDs       []string // file-service
+	SedimentIDs   []string // sediment
 }
 
 // GetConversationMapping 读取会话全量 mapping(轮询用)。
@@ -492,46 +491,52 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 }
 
 // PollOpts 控制 PollConversationForImages 的等待策略。
+//
+// IMG2 正式上线后不再做灰度命中判定,逻辑极简化:
+//   - 任一 tool 消息里出现 file-service / sediment asset_pointer → 立即算成功
+//   - 够 ExpectedN 张就立即返回,不等多余的
+//   - 没够数继续轮询,到 MaxWait 仍有至少 1 张也算成功(速度优先)
+//   - 全程没拿到图才是 timeout
 type PollOpts struct {
-	BaselineToolIDs map[string]struct{} // 发送前已存在的 tool 消息 id;本次回合只看新增
-	MaxWait         time.Duration       // 总超时,默认 300s
-	Interval        time.Duration       // 轮询间隔,默认 6s
-	StableRounds    int                 // 稳定轮数(连续 N 次 sed 不变视为稳定),默认 4
-	PreviewWait     time.Duration       // 第 1 条 tool 出现后等第 2 条的窗口,默认 30s
+	BaselineToolIDs map[string]struct{} // 发送前已存在的 tool 消息 id,本次回合只看新增
+	ExpectedN       int                 // 期望返回的图片张数,够了立即短路,默认 1
+	MaxWait         time.Duration       // 总超时,默认 300s(上游渲染慢时兜底补齐)
+	Interval        time.Duration       // 轮询间隔,默认 3s
 }
 
 // PollStatus 是 PollConversationForImages 的结果状态。
 type PollStatus string
 
 const (
-	PollStatusIMG2        PollStatus = "img2"         // 灰度命中,images 可用
-	PollStatusPreviewOnly PollStatus = "preview_only" // 只出 1 条 tool,判定非灰度
-	PollStatusTimeout     PollStatus = "timeout"
-	PollStatusError       PollStatus = "error"
+	PollStatusSuccess PollStatus = "success" // 至少拿到 1 张图
+	PollStatusTimeout PollStatus = "timeout" // 等到 MaxWait 仍然 0 张
+	PollStatusError   PollStatus = "error"   // 上游错误(429 熔断 / ctx 取消)
 )
 
-// PollConversationForImages 轮询会话直到灰度图出现。
-// 返回 (status, file_ids, sediment_ids)。状态为 img2 时 file_ids 或 sediment_ids 至少一个非空。
+// PollConversationForImages 轮询会话直到图片可用。
+//
+// 返回 (status, file_ids, sediment_ids)。status=success 时 file_ids/sediment_ids 至少一个非空。
+// file-service 优先(优先级更高),sediment 作为补充一并带出,调用方自行决定用几张。
 func (c *Client) PollConversationForImages(ctx context.Context, convID string, opt PollOpts) (PollStatus, []string, []string) {
-	if opt.MaxWait == 0 {
+	if opt.ExpectedN <= 0 {
+		opt.ExpectedN = 1
+	}
+	if opt.MaxWait <= 0 {
 		opt.MaxWait = 300 * time.Second
 	}
-	if opt.Interval == 0 {
-		opt.Interval = 6 * time.Second
-	}
-	if opt.StableRounds == 0 {
-		opt.StableRounds = 4
-	}
-	if opt.PreviewWait == 0 {
-		opt.PreviewWait = 30 * time.Second
+	if opt.Interval <= 0 {
+		opt.Interval = 3 * time.Second
 	}
 	baseline := opt.BaselineToolIDs
 
 	deadline := time.Now().Add(opt.MaxWait)
+
+	// 累计全程看到的 fid/sid,循环外可用(超时兜底:有图就算成功)
 	var (
-		stableCount   int
-		lastSedSig    string
-		firstToolTs   time.Time
+		allFile        []string
+		allSed         []string
+		seenFile       = map[string]struct{}{}
+		seenSed        = map[string]struct{}{}
 		consecutive429 int
 	)
 
@@ -558,7 +563,7 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		consecutive429 = 0
 
 		msgs := ExtractImageToolMsgs(mapping)
-		// baseline diff:只看本回合新增
+		// baseline diff:只看本回合新增 tool 消息
 		var newMsgs []ImageToolMsg
 		if len(baseline) > 0 {
 			for _, m := range msgs {
@@ -570,15 +575,8 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 			newMsgs = msgs
 		}
 
-		// 汇总所有新 tool 消息的 sed/file(**跨消息聚合**)。
-		// IMG2 灰度命中时,上游通常会发 2 条 tool 消息 —— 例如 1 条 sediment
-		// 预览 + 1 条 file-service 终稿,或者同一条消息里带多张 file id。
-		// 以前只取 newMsgs[last] 会丢掉前一条 preview / 另一张图;这里收集
-		// 全部 tool 消息里出现过的 id,调用方拿到几张就可以输出几张。
-		var allSed []string
-		var allFile []string
-		seenFile := map[string]struct{}{}
-		seenSed := map[string]struct{}{}
+		// 跨 tool 消息聚合 fid/sid。IMG2 一次调用可能先出 sediment 预览再补
+		// file-service 终稿,或同一条消息里带 N 张 file id;这里都累计起来。
 		for _, m := range newMsgs {
 			for _, f := range m.FileIDs {
 				if _, ok := seenFile[f]; !ok {
@@ -594,46 +592,18 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 			}
 		}
 
-		// 分支 1:file-service 直出 = IMG2 终稿。
-		// 有 file-service 直出就算命中,把所有 tool 消息累计到的 fid/sid 都带出去。
-		if len(allFile) > 0 {
-			return PollStatusIMG2, allFile, allSed
-		}
-
-		// 没有 tool 消息 → 继续等
-		if len(newMsgs) == 0 {
-			sleep(ctx, opt.Interval)
-			continue
-		}
-
-		// 首次出现第 1 条 tool,记时间
-		if firstToolTs.IsZero() && len(newMsgs) >= 1 {
-			firstToolTs = time.Now()
-		}
-
-		// 分支 2:已经 2+ 条 tool → 灰度命中,等 sed 稳定后一并返回。
-		if len(newMsgs) >= 2 {
-			sortedSed := append([]string(nil), allSed...)
-			sort.Strings(sortedSed)
-			sig := strings.Join(sortedSed, ",")
-			if sig == lastSedSig && sig != "" {
-				stableCount++
-				if stableCount >= opt.StableRounds {
-					return PollStatusIMG2, allFile, allSed
-				}
-			} else {
-				stableCount = 0
-				lastSedSig = sig
-			}
-		} else if !firstToolTs.IsZero() && time.Since(firstToolTs) >= opt.PreviewWait {
-			// 分支 3:只 1 条 tool 且超过窗口 → 非灰度预览。
-			// 把这条 tool 的 fids / sids 一并带出,外层可以用作 IMG1 预览兜底。
-			return PollStatusPreviewOnly, allFile, allSed
+		// 够 N 张立即短路返回(file-service 优先占配额,sediment 补位)
+		if len(allFile)+len(allSed) >= opt.ExpectedN {
+			return PollStatusSuccess, allFile, allSed
 		}
 
 		sleep(ctx, opt.Interval)
 	}
 
+	// 超时兜底:只要拿到过至少 1 张,就算成功(速度优先,不等齐 N)
+	if len(allFile)+len(allSed) > 0 {
+		return PollStatusSuccess, allFile, allSed
+	}
 	return PollStatusTimeout, nil, nil
 }
 

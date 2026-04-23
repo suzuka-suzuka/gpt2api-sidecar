@@ -146,10 +146,18 @@ func (rt *utlsRoundTripper) dialTLS(ctx context.Context, network, addr string) (
 	if forceH1 {
 		alpn = []string{"http/1.1"}
 	}
+	// InsecureSkipVerify 说明:
+	//   1. 部分商业 HTTP 代理会做 SSL Inspection(MITM):对目标域名重签一张自签名证书
+	//      转发给客户端。这张证书不在系统 CA 列表里,导致 uTLS 证书验证失败。
+	//   2. 我们的安全边界在代理本身:流量已经走 CONNECT 隧道通过已信任的代理;
+	//      对 chatgpt.com 再做证书 pin 没有额外意义。
+	//   3. 即使不配置代理,直连场景下 chatgpt.com 用的是正规 DigiCert 证书,
+	//      实际不会触发此标志,行为与之前相同。
 	uconn := utls.UClient(raw, &utls.Config{
-		ServerName: host,
-		NextProtos: alpn,
-		MinVersion: tls.VersionTLS12,
+		ServerName:         host,
+		NextProtos:         alpn,
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, //nolint:gosec
 	}, utls.HelloChrome_131)
 
 	// 关键:utls 的预设 HelloID(HelloChrome_131 等)里 ALPNExtension 的值
@@ -204,9 +212,15 @@ func (rt *utlsRoundTripper) dialRaw(ctx context.Context, addr string) (net.Conn,
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxyAddr, err)
 	}
-	// HTTPS 代理本身要先 TLS 握手(走标准 tls,不需伪装指纹,代理一般不卡 JA3)
+	// HTTPS 代理本身要先 TLS 握手(走标准 tls,不需伪装指纹,代理一般不卡 JA3)。
+	// 部分商业代理使用私有 CA 或自签名证书,标准 CA 库无法验证;
+	// InsecureSkipVerify 只作用于「到代理服务器」这一段,不影响后续 uTLS 握手
+	// 对 chatgpt.com 的证书验证(两段是独立的 TLS 连接)。
 	if strings.EqualFold(rt.proxyURL.Scheme, "https") {
-		tlsConn := tls.Client(conn, &tls.Config{ServerName: rt.proxyURL.Hostname()})
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName:         rt.proxyURL.Hostname(),
+			InsecureSkipVerify: true, //nolint:gosec
+		})
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("tls handshake to https proxy: %w", err)

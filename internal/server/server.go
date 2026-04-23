@@ -487,7 +487,7 @@ func (s *Server) writeRunnerError(w http.ResponseWriter, err error) {
 
 	status := http.StatusBadGateway
 	switch imageErr.Code {
-	case runner.ErrNoAccount, runner.ErrRateLimited:
+	case runner.ErrNoAccount, runner.ErrRateLimited, runner.ErrNetworkTransient:
 		status = http.StatusServiceUnavailable
 	case runner.ErrAuthRequired:
 		status = http.StatusUnauthorized
@@ -503,6 +503,8 @@ func localizeRunnerError(code, message string) string {
 		return "当前没有可用 ChatGPT 账号。"
 	case runner.ErrRateLimited:
 		return "上游触发限流，账号已进入冷却。"
+	case runner.ErrNetworkTransient:
+		return "连接上游时出现瞬态网络错误，请稍后重试。"
 	case runner.ErrAuthRequired:
 		return "账号鉴权失败，已自动停用该账号。"
 	case runner.ErrPreviewOnly:

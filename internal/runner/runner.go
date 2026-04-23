@@ -16,16 +16,17 @@ import (
 )
 
 const (
-	ErrUnknown      = "unknown"
-	ErrNoAccount    = "no_available_account"
-	ErrAuthRequired = "auth_required"
-	ErrRateLimited  = "rate_limited"
-	ErrPOWTimeout   = "pow_timeout"
-	ErrPOWFailed    = "pow_failed"
-	ErrPreviewOnly  = "preview_only"
-	ErrPollTimeout  = "poll_timeout"
-	ErrDownload     = "download_failed"
-	ErrUpstream     = "upstream_error"
+	ErrUnknown          = "unknown"
+	ErrNoAccount        = "no_available_account"
+	ErrAuthRequired     = "auth_required"
+	ErrRateLimited      = "rate_limited"
+	ErrNetworkTransient = "network_transient"
+	ErrPOWTimeout       = "pow_timeout"
+	ErrPOWFailed        = "pow_failed"
+	ErrPreviewOnly      = "preview_only"
+	ErrPollTimeout      = "poll_timeout"
+	ErrDownload         = "download_failed"
+	ErrUpstream         = "upstream_error"
 )
 
 type ReferenceImage struct {
@@ -105,7 +106,9 @@ func (r *Runner) Run(ctx context.Context, req Request) *Result {
 			result.ErrorMessage = err.Error()
 		}
 
-		if code != ErrPreviewOnly && code != ErrRateLimited && code != ErrAuthRequired {
+		retryable := code == ErrPreviewOnly || code == ErrRateLimited ||
+			code == ErrAuthRequired || code == ErrNetworkTransient
+		if !retryable {
 			return result
 		}
 	}
@@ -176,14 +179,12 @@ func (r *Runner) runConversation(
 	const sameConvMax = 3
 
 	var (
-		convID          string
-		parentID        = uuid.NewString()
-		messageID       = uuid.NewString()
-		fileRefs        []string
-		lastPreviewFids []string
-		lastPreviewSids []string
-		baselineTools   = map[string]struct{}{}
-		isPreview       bool
+		convID        string
+		parentID      = uuid.NewString()
+		messageID     = uuid.NewString()
+		fileRefs      []string
+		baselineTools = map[string]struct{}{}
+		isPreview     bool
 	)
 
 	for turn := 1; turn <= sameConvMax; turn++ {
@@ -238,40 +239,26 @@ func (r *Runner) runConversation(
 			zap.Int("sediment_refs", len(sseResult.SedimentIDs)),
 		)
 
-		if len(sseResult.FileIDs) > 0 {
-			fileRefs = append(fileRefs, sseResult.FileIDs...)
-			for _, sid := range sseResult.SedimentIDs {
-				fileRefs = append(fileRefs, "sed:"+sid)
-			}
+		fileRefs = append(fileRefs, sseResult.FileIDs...)
+		for _, sid := range sseResult.SedimentIDs {
+			fileRefs = append(fileRefs, "sed:"+sid)
+		}
+		if len(fileRefs) > 0 {
 			break
 		}
 
 		status, fids, sids := client.PollConversationForImages(ctx, convID, chatgpt.PollOpts{
 			MaxWait:         req.PollMaxWait,
 			BaselineToolIDs: baselineTools,
+			ExpectedN:       1,
 		})
 		switch status {
-		case chatgpt.PollStatusIMG2:
+		case chatgpt.PollStatusSuccess:
 			fileRefs = append(fileRefs, fids...)
 			for _, sid := range sids {
 				fileRefs = append(fileRefs, "sed:"+sid)
 			}
 			break
-
-		case chatgpt.PollStatusPreviewOnly:
-			lastPreviewFids = append([]string(nil), fids...)
-			lastPreviewSids = append([]string(nil), sids...)
-			if turn < sameConvMax {
-				if mapping, err := client.GetConversationMapping(ctx, convID); err == nil {
-					if newBaseline := buildToolBaseline(mapping); newBaseline != nil {
-						baselineTools = newBaseline
-					}
-					if head, _ := mapping["current_node"].(string); head != "" {
-						parentID = head
-					}
-				}
-				continue
-			}
 
 		case chatgpt.PollStatusTimeout:
 			return nil, ErrPollTimeout, errors.New("poll timeout")
@@ -286,14 +273,7 @@ func (r *Runner) runConversation(
 	}
 
 	if len(fileRefs) == 0 {
-		if len(lastPreviewFids) == 0 && len(lastPreviewSids) == 0 {
-			return nil, ErrPreviewOnly, errors.New("no image refs produced")
-		}
-		isPreview = true
-		fileRefs = append(fileRefs, lastPreviewFids...)
-		for _, sid := range lastPreviewSids {
-			fileRefs = append(fileRefs, "sed:"+sid)
-		}
+		return nil, ErrPollTimeout, errors.New("no image refs produced")
 	}
 
 	images := make([]Image, 0, len(fileRefs))
@@ -438,8 +418,15 @@ func (r *Runner) classifyUpstream(err error) string {
 		return ErrUpstream
 	}
 
-	if strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") {
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "deadline exceeded") {
 		return ErrPollTimeout
+	}
+	if strings.Contains(msg, "EOF") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "broken pipe") {
+		return ErrNetworkTransient
 	}
 
 	return ErrUpstream
