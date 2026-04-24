@@ -19,16 +19,18 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen         string `yaml:"listen"`
-	PublicBaseURL  string `yaml:"public_base_url"`
-	LogLevel       string `yaml:"log_level"`
-	LogFormat      string `yaml:"log_format"`
-	RequestTimeout string `yaml:"request_timeout"`
-	AcquireTimeout string `yaml:"acquire_timeout"`
-	MinInterval    string `yaml:"min_interval"`
-	Cooldown429    string `yaml:"cooldown_429"`
-	BlobTTL        string `yaml:"blob_ttl"`
-	MaxImageBytes  int64  `yaml:"max_image_bytes"`
+	Listen           string `yaml:"listen"`
+	PublicBaseURL    string `yaml:"public_base_url"`
+	LogLevel         string `yaml:"log_level"`
+	LogFormat        string `yaml:"log_format"`
+	RequestTimeout   string `yaml:"request_timeout"`
+	QueueWaitTimeout string `yaml:"queue_wait_timeout"`
+	MaxQueueSize     int    `yaml:"max_queue_size"`
+	AcquireTimeout   string `yaml:"acquire_timeout"`
+	MinInterval      string `yaml:"min_interval"`
+	Cooldown429      string `yaml:"cooldown_429"`
+	BlobTTL          string `yaml:"blob_ttl"`
+	MaxImageBytes    int64  `yaml:"max_image_bytes"`
 }
 
 type AuthConfig struct {
@@ -93,14 +95,20 @@ func (c *Config) applyDefaults() {
 	if c.Server.RequestTimeout == "" {
 		c.Server.RequestTimeout = "8m"
 	}
+	if c.Server.QueueWaitTimeout == "" {
+		c.Server.QueueWaitTimeout = "10m"
+	}
+	if c.Server.MaxQueueSize <= 0 {
+		c.Server.MaxQueueSize = 32
+	}
 	if c.Server.AcquireTimeout == "" {
-		c.Server.AcquireTimeout = "45s"
+		c.Server.AcquireTimeout = "2m"
 	}
 	if c.Server.MinInterval == "" {
-		c.Server.MinInterval = "60s"
+		c.Server.MinInterval = "10s"
 	}
 	if c.Server.Cooldown429 == "" {
-		c.Server.Cooldown429 = "10m"
+		c.Server.Cooldown429 = "5m"
 	}
 	if c.Server.BlobTTL == "" {
 		c.Server.BlobTTL = "20m"
@@ -160,6 +168,9 @@ func (c *Config) validate() error {
 	if _, err := c.AcquireTimeoutDuration(); err != nil {
 		return err
 	}
+	if _, err := c.QueueWaitTimeoutDuration(); err != nil {
+		return err
+	}
 	if _, err := c.MinIntervalDuration(); err != nil {
 		return err
 	}
@@ -208,6 +219,10 @@ func (c *Config) RequestTimeoutDuration() (time.Duration, error) {
 
 func (c *Config) AcquireTimeoutDuration() (time.Duration, error) {
 	return parseDurationField("server.acquire_timeout", c.Server.AcquireTimeout)
+}
+
+func (c *Config) QueueWaitTimeoutDuration() (time.Duration, error) {
+	return parseDurationField("server.queue_wait_timeout", c.Server.QueueWaitTimeout)
 }
 
 func (c *Config) MinIntervalDuration() (time.Duration, error) {

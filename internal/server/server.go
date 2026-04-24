@@ -20,19 +20,26 @@ import (
 	"go.uber.org/zap"
 	"gpt2api-sidecar/internal/config"
 	"gpt2api-sidecar/internal/pool"
+	"gpt2api-sidecar/internal/queue"
 	"gpt2api-sidecar/internal/runner"
 	"gpt2api-sidecar/pkg/logger"
 )
 
-const maxReferenceImages = 4
+const (
+	maxReferenceImages = 4
+	errQueueFull       = "queue_full"
+	errQueueTimeout    = "queue_timeout"
+)
 
 type Server struct {
-	cfg       *config.Config
-	pool      *pool.Pool
-	runner    *runner.Runner
-	apiKeys   map[string]struct{}
-	models    map[string]config.ModelConfig
-	blobStore *blobStore
+	cfg              *config.Config
+	pool             *pool.Pool
+	runner           *runner.Runner
+	apiKeys          map[string]struct{}
+	models           map[string]config.ModelConfig
+	blobStore        *blobStore
+	imageQueue       *queue.Gate
+	queueWaitTimeout time.Duration
 }
 
 func New(cfg *config.Config, p *pool.Pool, r *runner.Runner, blobTTL time.Duration) *Server {
@@ -44,13 +51,20 @@ func New(cfg *config.Config, p *pool.Pool, r *runner.Runner, blobTTL time.Durati
 	for _, key := range cfg.Auth.APIKeys {
 		apiKeys[key] = struct{}{}
 	}
+	queueWaitTimeout, _ := cfg.QueueWaitTimeoutDuration()
+	queueLimit := len(p.States())
+	if queueLimit <= 0 {
+		queueLimit = 1
+	}
 	return &Server{
-		cfg:       cfg,
-		pool:      p,
-		runner:    r,
-		apiKeys:   apiKeys,
-		models:    models,
-		blobStore: newBlobStore(blobTTL),
+		cfg:              cfg,
+		pool:             p,
+		runner:           r,
+		apiKeys:          apiKeys,
+		models:           models,
+		blobStore:        newBlobStore(blobTTL),
+		imageQueue:       queue.New(queueLimit, cfg.Server.MaxQueueSize),
+		queueWaitTimeout: queueWaitTimeout,
 	}
 }
 
@@ -70,6 +84,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 		"status":   "ok",
 		"models":   len(s.models),
 		"accounts": s.pool.States(),
+		"queue":    s.imageQueue.Stats(),
 	})
 }
 
@@ -231,6 +246,12 @@ func (s *Server) generateImages(
 	n int,
 	responseFormat string,
 ) ([]imageResponseItem, error) {
+	queueLease, err := s.acquireImageQueue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer queueLease.Release()
+
 	items := make([]imageResponseItem, 0, n)
 	runs := 0
 
@@ -272,6 +293,46 @@ func (s *Server) generateImages(
 	}
 
 	return items, nil
+}
+
+func (s *Server) acquireImageQueue(ctx context.Context) (*queue.Lease, error) {
+	waitCtx := ctx
+	cancel := func() {}
+	if s.queueWaitTimeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, s.queueWaitTimeout)
+	}
+	defer cancel()
+
+	start := time.Now()
+	lease, err := s.imageQueue.Acquire(waitCtx)
+	if err != nil {
+		switch {
+		case errors.Is(err, queue.ErrQueueFull):
+			return nil, &runnerError{
+				Code:    errQueueFull,
+				Message: "image queue is full",
+			}
+		case errors.Is(err, context.DeadlineExceeded):
+			return nil, &runnerError{
+				Code:    errQueueTimeout,
+				Message: "timed out while waiting in the image queue",
+			}
+		default:
+			return nil, err
+		}
+	}
+
+	wait := time.Since(start)
+	if wait >= 500*time.Millisecond {
+		stats := s.imageQueue.Stats()
+		logger.L().Info("image queue acquired",
+			zap.Duration("wait", wait),
+			zap.Int("active", stats.Active),
+			zap.Int("pending", stats.Pending),
+		)
+	}
+
+	return lease, nil
 }
 
 func (s *Server) makeImageResponseItem(image runner.Image, responseFormat string) imageResponseItem {
@@ -487,14 +548,14 @@ func (s *Server) writeRunnerError(w http.ResponseWriter, err error) {
 
 	status := http.StatusBadGateway
 	switch imageErr.Code {
-	case runner.ErrNoAccount, runner.ErrRateLimited, runner.ErrNetworkTransient:
+	case runner.ErrNoAccount, runner.ErrRateLimited, runner.ErrNetworkTransient, errQueueFull, errQueueTimeout:
 		status = http.StatusServiceUnavailable
 	case runner.ErrAuthRequired:
 		status = http.StatusUnauthorized
 	case runner.ErrPreviewOnly, runner.ErrPollTimeout, runner.ErrDownload:
 		status = http.StatusBadGateway
 	}
-	writeOpenAIError(w, status, imageErr.Code, localizeRunnerError(imageErr.Code, imageErr.Message))
+	writeOpenAIError(w, status, imageErr.Code, localizeImageError(imageErr.Code, imageErr.Message))
 }
 
 func localizeRunnerError(code, message string) string {
@@ -518,6 +579,34 @@ func localizeRunnerError(code, message string) string {
 			return message
 		}
 		return "图片生成失败。"
+	}
+}
+
+func localizeImageError(code, message string) string {
+	switch code {
+	case runner.ErrNoAccount:
+		return "No ChatGPT account is available right now."
+	case runner.ErrRateLimited:
+		return "Upstream rate limiting was triggered and the account was cooled down."
+	case runner.ErrNetworkTransient:
+		return "A transient upstream network error occurred. Please retry shortly."
+	case runner.ErrAuthRequired:
+		return "Account authentication failed and the account was disabled."
+	case runner.ErrPreviewOnly:
+		return "Only a preview result was returned."
+	case runner.ErrPollTimeout:
+		return "Timed out while waiting for the final image result."
+	case runner.ErrDownload:
+		return "The image was generated, but downloading the bytes failed."
+	case errQueueFull:
+		return "The image request queue is full. Please retry shortly."
+	case errQueueTimeout:
+		return "Timed out while waiting in the image request queue."
+	default:
+		if strings.TrimSpace(message) != "" {
+			return message
+		}
+		return "Image generation failed."
 	}
 }
 

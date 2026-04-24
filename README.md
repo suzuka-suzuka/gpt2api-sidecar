@@ -87,6 +87,15 @@ cp config.example.yaml config.yaml
 - `accounts[].proxy_url`
   - 可选；如果你的账号必须走代理访问 `chatgpt.com`，这里要填
 
+Queue settings:
+
+- `server.queue_wait_timeout`
+  - Maximum time a request may wait in the FIFO image queue before returning `503 queue_timeout`.
+- `server.max_queue_size`
+  - Maximum number of waiting requests. Additional requests return `503 queue_full`.
+
+The sidecar sizes image worker slots from the number of loaded accounts. Requests above that capacity wait in a FIFO queue before entering the account pool.
+
 如果 `device_id` 和 `session_id` 为空，sidecar 首次启动时会自动生成，并回写到 `config.yaml`，用来保持账号指纹稳定。
 
 ## 下载安装后怎么启动
@@ -178,6 +187,8 @@ curl http://127.0.0.1:46321/healthz
 curl http://127.0.0.1:46321/v1/models \
   -H "Authorization: Bearer sakura-sidecar-key"
 ```
+
+`/healthz` now includes `queue.limit`, `queue.active`, and `queue.pending` so you can monitor current image queue pressure.
 
 ## 当前边界
 

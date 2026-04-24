@@ -4,9 +4,11 @@ server:
   log_level: info
   log_format: console
   request_timeout: 8m
-  acquire_timeout: 45s
-  min_interval: 60s
-  cooldown_429: 10m
+  queue_wait_timeout: 10m
+  max_queue_size: 32
+  acquire_timeout: 2m
+  min_interval: 10s
+  cooldown_429: 5m
   blob_ttl: 20m
   max_image_bytes: 16777216
 
