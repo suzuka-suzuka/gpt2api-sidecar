@@ -27,6 +27,7 @@ const (
 	ErrPollTimeout      = "poll_timeout"
 	ErrDownload         = "download_failed"
 	ErrUpstream         = "upstream_error"
+	defaultTransientCooldown = 30 * time.Second
 )
 
 type ReferenceImage struct {
@@ -107,7 +108,8 @@ func (r *Runner) Run(ctx context.Context, req Request) *Result {
 		}
 
 		retryable := code == ErrPreviewOnly || code == ErrRateLimited ||
-			code == ErrAuthRequired || code == ErrNetworkTransient
+			code == ErrAuthRequired || code == ErrNetworkTransient ||
+			code == ErrPollTimeout || code == ErrDownload || code == ErrUpstream
 		if !retryable {
 			return result
 		}
@@ -209,9 +211,18 @@ func (r *Runner) runConversation(
 
 		if conduitToken, err := client.PrepareFConversation(ctx, convOpt); err == nil {
 			convOpt.ConduitToken = conduitToken
-		} else if code := r.classifyUpstream(err); code == ErrRateLimited {
-			r.pool.MarkRateLimited(accountName, r.cooldown429)
-			return nil, ErrRateLimited, err
+		} else {
+			code := r.classifyUpstream(err)
+			if code == ErrRateLimited {
+				r.pool.MarkRateLimited(accountName, r.cooldown429)
+			}
+			if code == ErrAuthRequired {
+				r.pool.MarkUnauthorized(accountName)
+			}
+			if code == ErrNetworkTransient || code == ErrUpstream {
+				r.markTransientFailure(accountName)
+			}
+			return nil, code, err
 		}
 
 		stream, err := client.StreamFConversation(ctx, convOpt)
@@ -222,6 +233,9 @@ func (r *Runner) runConversation(
 			}
 			if code == ErrAuthRequired {
 				r.pool.MarkUnauthorized(accountName)
+			}
+			if code == ErrNetworkTransient || code == ErrUpstream {
+				r.markTransientFailure(accountName)
 			}
 			return nil, code, err
 		}
@@ -261,9 +275,11 @@ func (r *Runner) runConversation(
 			break
 
 		case chatgpt.PollStatusTimeout:
+			r.markTransientFailure(accountName)
 			return nil, ErrPollTimeout, errors.New("poll timeout")
 
 		default:
+			r.markTransientFailure(accountName)
 			return nil, ErrUpstream, errors.New("poll returned error")
 		}
 
@@ -273,6 +289,7 @@ func (r *Runner) runConversation(
 	}
 
 	if len(fileRefs) == 0 {
+		r.markTransientFailure(accountName)
 		return nil, ErrPollTimeout, errors.New("no image refs produced")
 	}
 
@@ -304,6 +321,7 @@ func (r *Runner) runConversation(
 		})
 	}
 	if len(images) == 0 {
+		r.markTransientFailure(accountName)
 		return nil, ErrDownload, errors.New("all image downloads failed")
 	}
 
@@ -335,6 +353,9 @@ func (r *Runner) uploadReferences(
 			if code == ErrAuthRequired {
 				r.pool.MarkUnauthorized(accountName)
 			}
+			if code == ErrNetworkTransient || code == ErrUpstream {
+				r.markTransientFailure(accountName)
+			}
 			return nil, code, fmt.Errorf("upload reference %d: %w", idx+1, err)
 		}
 		out = append(out, uploaded)
@@ -356,6 +377,9 @@ func (r *Runner) getRequirements(
 		}
 		if code == ErrAuthRequired {
 			r.pool.MarkUnauthorized(accountName)
+		}
+		if code == ErrNetworkTransient || code == ErrUpstream {
+			r.markTransientFailure(accountName)
 		}
 		return nil, "", code, err
 	}
@@ -387,6 +411,14 @@ func (r *Runner) getRequirements(
 	}
 
 	return cr, proofToken, "", nil
+}
+
+func (r *Runner) markTransientFailure(accountName string) {
+	cooldown := time.Duration(defaultTransientCooldown)
+	if r.cooldown429 > 0 && r.cooldown429 < cooldown {
+		cooldown = r.cooldown429
+	}
+	r.pool.MarkCooldown(accountName, cooldown)
 }
 
 func buildToolBaseline(mapping map[string]interface{}) map[string]struct{} {

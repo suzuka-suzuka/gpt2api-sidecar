@@ -142,11 +142,23 @@ func (l *Lease) Release() {
 }
 
 func (p *Pool) MarkRateLimited(name string, cooldown time.Duration) {
+	p.MarkCooldown(name, cooldown)
+}
+
+func (p *Pool) MarkCooldown(name string, cooldown time.Duration) {
+	if cooldown <= 0 {
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	until := time.Now().Add(cooldown)
 	for _, acc := range p.accounts {
 		if acc.snapshot.Name == name {
-			acc.cooldownUntil = time.Now().Add(cooldown)
+			if until.After(acc.cooldownUntil) {
+				acc.cooldownUntil = until
+			}
 			return
 		}
 	}
