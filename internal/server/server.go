@@ -27,7 +27,7 @@ import (
 
 const (
 	maxReferenceImages = 4
-	imageJobTimeout    = 3 * time.Minute
+	imageJobTimeout    = 4 * time.Minute
 	errQueueFull       = "queue_full"
 	errQueueTimeout    = "queue_timeout"
 	errImageTimeout    = "image_timeout"
@@ -295,7 +295,7 @@ func (s *Server) generateImages(
 	requestTimeout, _ := s.cfg.RequestTimeoutDuration()
 	acquireTimeout, _ := s.cfg.AcquireTimeoutDuration()
 	taskTimeout := requestTimeout
-	if taskTimeout <= 0 || taskTimeout > imageJobTimeout {
+	if taskTimeout <= 0 {
 		taskTimeout = imageJobTimeout
 	}
 	maxAttempts := 2
@@ -319,7 +319,7 @@ func (s *Server) generateImages(
 				message := result.ErrorMessage
 				if code == runner.ErrPollTimeout {
 					code = errImageTimeout
-					message = "no image returned within 3 minutes after an account was acquired"
+					message = fmt.Sprintf("no image returned within %s after an account was acquired", taskTimeout)
 				}
 				results <- imageJobResult{
 					Index:        idx,
@@ -699,7 +699,10 @@ func localizeImageError(code, message string) string {
 	case runner.ErrDownload:
 		return "The image was generated, but downloading the bytes failed."
 	case errImageTimeout:
-		return "No image was returned within 3 minutes."
+		if strings.TrimSpace(message) != "" {
+			return message
+		}
+		return "No image was returned before the configured timeout."
 	case errQueueFull:
 		return "The image request queue is full. Please retry shortly."
 	case errQueueTimeout:

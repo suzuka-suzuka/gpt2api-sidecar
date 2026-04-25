@@ -385,9 +385,34 @@ func (r *Runner) uploadReferences(
 
 	out := make([]*chatgpt.UploadedFile, 0, len(references))
 	for idx, ref := range references {
-		uploaded, err := client.UploadFile(ctx, ref.Data, ref.FileName)
+		var (
+			uploaded *chatgpt.UploadedFile
+			err      error
+			code     string
+		)
+		for attempt := 1; attempt <= 3; attempt++ {
+			uploaded, err = client.UploadFile(ctx, ref.Data, ref.FileName)
+			if err == nil {
+				break
+			}
+
+			code = r.classifyUpstream(err)
+			if code != ErrNetworkTransient || ctx.Err() != nil || attempt == 3 {
+				break
+			}
+
+			logger.L().Warn("sidecar upload reference transient failure, retrying",
+				zap.String("account", accountName),
+				zap.Int("reference", idx+1),
+				zap.Int("attempt", attempt),
+				zap.Error(err),
+			)
+			sleepContext(ctx, time.Duration(attempt)*500*time.Millisecond)
+		}
 		if err != nil {
-			code := r.classifyUpstream(err)
+			if code == "" {
+				code = r.classifyUpstream(err)
+			}
 			if code == ErrRateLimited {
 				r.pool.MarkRateLimited(accountName, r.cooldown429)
 			}
@@ -403,6 +428,15 @@ func (r *Runner) uploadReferences(
 	}
 
 	return out, "", nil
+}
+
+func sleepContext(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func (r *Runner) getRequirements(

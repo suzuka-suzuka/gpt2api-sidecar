@@ -3,8 +3,8 @@ server:
   public_base_url: http://127.0.0.1:46321
   log_level: info
   log_format: console
-  request_timeout: 3m
-  queue_wait_timeout: 10m
+  request_timeout: 4m
+  queue_wait_timeout: 6m
   max_queue_size: 32
   acquire_timeout: 2m
   min_interval: 10s

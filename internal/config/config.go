@@ -98,10 +98,10 @@ func (c *Config) applyDefaults() {
 		c.Server.LogFormat = "console"
 	}
 	if c.Server.RequestTimeout == "" {
-		c.Server.RequestTimeout = "8m"
+		c.Server.RequestTimeout = "4m"
 	}
 	if c.Server.QueueWaitTimeout == "" {
-		c.Server.QueueWaitTimeout = "10m"
+		c.Server.QueueWaitTimeout = "6m"
 	}
 	if c.Server.MaxQueueSize <= 0 {
 		c.Server.MaxQueueSize = 32

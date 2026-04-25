@@ -428,17 +428,17 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 		author, _ := msg["author"].(map[string]interface{})
 		meta, _ := msg["metadata"].(map[string]interface{})
 		content, _ := msg["content"].(map[string]interface{})
-		if author == nil || meta == nil || content == nil {
+		if author == nil || content == nil {
 			continue
 		}
 		if s, _ := author["role"].(string); s != "tool" {
 			continue
 		}
-		if s, _ := meta["async_task_type"].(string); s != "image_gen" {
-			continue
-		}
 		if s, _ := content["content_type"].(string); s != "multimodal_text" {
 			continue
+		}
+		if meta == nil {
+			meta = map[string]interface{}{}
 		}
 
 		tm := ImageToolMsg{MessageID: mid}
@@ -484,6 +484,10 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 			case string:
 				extractAsset(v)
 			}
+		}
+		asyncTask, _ := meta["async_task_type"].(string)
+		if asyncTask != "image_gen" && len(tm.FileIDs) == 0 && len(tm.SedimentIDs) == 0 {
+			continue
 		}
 		out = append(out, tm)
 	}
