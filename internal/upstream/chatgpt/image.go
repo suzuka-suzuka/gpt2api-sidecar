@@ -20,6 +20,7 @@ package chatgpt
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -545,6 +546,12 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
+			if len(allFile)+len(allSed) > 0 {
+				return PollStatusSuccess, allFile, allSed
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return PollStatusTimeout, nil, nil
+			}
 			return PollStatusError, nil, nil
 		default:
 		}
@@ -553,10 +560,11 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		if err != nil {
 			if ue, ok := err.(*UpstreamError); ok && ue.Status == 429 {
 				consecutive429++
-				if consecutive429 >= 3 {
-					return PollStatusError, nil, nil
+				backoff := time.Duration(consecutive429) * 10 * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
 				}
-				sleep(ctx, 10*time.Second)
+				sleep(ctx, backoff)
 				continue
 			}
 			sleep(ctx, opt.Interval)

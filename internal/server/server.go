@@ -317,7 +317,7 @@ func (s *Server) generateImages(
 			if result.ErrorCode != "" {
 				code := result.ErrorCode
 				message := result.ErrorMessage
-				if code == runner.ErrPollTimeout && strings.Contains(strings.ToLower(message), "deadline exceeded") {
+				if code == runner.ErrPollTimeout {
 					code = errImageTimeout
 					message = "no image returned within 3 minutes after an account was acquired"
 				}

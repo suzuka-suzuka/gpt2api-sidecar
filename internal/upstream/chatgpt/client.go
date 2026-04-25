@@ -314,27 +314,13 @@ func (c *Client) ChatRequirements(ctx context.Context) (*ChatRequirementsResp, e
 	if err := json.Unmarshal(buf, &out); err != nil {
 		return nil, fmt.Errorf("decode chat-requirements: %w", err)
 	}
-	// 诊断用:打印完整 body(含 turnstile / proofofwork / arkose 字段)。
-	// 稳定后可改成 Debug 或删除。
 	if logger := loggerL(); logger != nil {
-		bodyStr := string(buf)
-		if len(bodyStr) > 800 {
-			bodyStr = bodyStr[:800] + "..."
-		}
-		logger.Info("chat-requirements raw body",
-			zap.String("body", bodyStr),
+		logger.Info("chat-requirements parsed",
 			zap.Bool("turnstile_required", out.Turnstile.Required),
 			zap.Bool("pow_required", out.Proofofwork.Required),
-			zap.String("token_prefix", truncatePrefix(out.Token, 16)))
+			zap.Bool("token_present", out.Token != ""))
 	}
 	return &out, nil
-}
-
-func truncatePrefix(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "..."
 }
 
 // ChatRequirementsPrepareResp 是 /sentinel/chat-requirements/prepare 的响应。

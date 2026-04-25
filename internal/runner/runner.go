@@ -285,6 +285,14 @@ func (r *Runner) runConversation(
 			IgnoreFileIDs:   inputFileIDs,
 			ExpectedN:       1,
 		})
+		logger.L().Info("sidecar image poll done",
+			zap.String("account", accountName),
+			zap.Int("turn", turn),
+			zap.String("conversation_id", convID),
+			zap.String("status", string(status)),
+			zap.Int("file_refs", len(fids)),
+			zap.Int("sediment_refs", len(sids)),
+		)
 		switch status {
 		case chatgpt.PollStatusSuccess:
 			fileRefs = append(fileRefs, fids...)
@@ -295,6 +303,9 @@ func (r *Runner) runConversation(
 
 		case chatgpt.PollStatusTimeout:
 			r.markTransientFailure(accountName)
+			if ctx.Err() != nil {
+				return nil, ErrPollTimeout, fmt.Errorf("poll timeout: %w", ctx.Err())
+			}
 			return nil, ErrPollTimeout, errors.New("poll timeout")
 
 		default:
