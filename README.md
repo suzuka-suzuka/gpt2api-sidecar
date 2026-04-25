@@ -141,7 +141,7 @@ Queue settings:
 - `server.acquire_timeout`
   - 单个出图子任务等待可用账号的最长时间。
 - `server.request_timeout`
-  - 单个出图子任务拿到账号后等待上游返回图片的最长时间；当前代码会把它封顶到 3 分钟。
+  - 单个出图子任务拿到账号后等待上游返回图片的最长时间；示例值为 `4m`，适合约 2 分钟出图再留一段余量。
 
 The sidecar sizes image worker slots from the number of loaded accounts. Requests above that capacity wait in a FIFO queue before entering the account pool.
 
@@ -149,7 +149,7 @@ The sidecar sizes image worker slots from the number of loaded accounts. Request
 
 - `n > 1` 时会拆成 `n` 个并发出图任务，每个任务独立抢一个账号并跑完整 ChatGPT 图片链路。
 - 任意并发任务先返回的图片会先被聚合；凑够 `n` 张就立即返回，并取消剩余任务。
-- 每个子任务拿到账号后最多等待 3 分钟；超时的子任务会记为 `image_timeout`。
+- 每个子任务拿到账号后最多等待 `server.request_timeout`；示例配置为 `4m`，超时的子任务会记为 `image_timeout`。
 - 如果所有子任务都失败或超时，接口会返回错误；如果已经拿到部分图片但没凑够 `n` 张，会返回已拿到的图片，优先保证速度。
 
 如果 `device_id` 和 `session_id` 为空，sidecar 首次启动时会自动生成，并回写到 `config.yaml`，用来保持账号指纹稳定。
@@ -250,7 +250,7 @@ curl http://127.0.0.1:46321/v1/models \
 
 - 目前只做图片接口
 - `POST /v1/chat/completions` 仍然返回 `501`
-- 单个出图子任务拿到账号后最多等待 3 分钟；追求速度时建议用更大的账号池承接 `n > 1` 的并发拆分
+- 单个出图子任务拿到账号后最多等待 `server.request_timeout`；示例配置为 `4m`，追求速度时建议用更大的账号池承接 `n > 1` 的并发拆分
 - 修改 `config.yaml` 里的 `models`、`api_keys`、`accounts` 后，需要重启 sidecar
 - 当前没有实现配置热重载
 
