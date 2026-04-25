@@ -37,6 +37,11 @@ type AuthConfig struct {
 	APIKeys []string `yaml:"api_keys"`
 }
 
+const (
+	ModelTypeImage = "image"
+	ModelTypeChat  = "chat"
+)
+
 type ModelConfig struct {
 	ID       string `yaml:"id"`
 	Upstream string `yaml:"upstream"`
@@ -122,7 +127,7 @@ func (c *Config) applyDefaults() {
 			c.Models[i].Upstream = "auto"
 		}
 		if c.Models[i].Type == "" {
-			c.Models[i].Type = "image"
+			c.Models[i].Type = ModelTypeImage
 		}
 	}
 }
@@ -143,7 +148,7 @@ func (c *Config) validate() error {
 		if strings.TrimSpace(model.ID) == "" {
 			return errors.New("config.models contains a model without id")
 		}
-		if model.Type != "image" {
+		if model.Type != ModelTypeImage && model.Type != ModelTypeChat {
 			return fmt.Errorf("model %q has unsupported type %q", model.ID, model.Type)
 		}
 	}

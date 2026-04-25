@@ -27,8 +27,10 @@ import (
 
 const (
 	maxReferenceImages = 4
+	imageJobTimeout    = 3 * time.Minute
 	errQueueFull       = "queue_full"
 	errQueueTimeout    = "queue_timeout"
+	errImageTimeout    = "image_timeout"
 )
 
 type Server struct {
@@ -94,6 +96,16 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 		Object  string `json:"object"`
 		Created int64  `json:"created"`
 		OwnedBy string `json:"owned_by"`
+		Type    string `json:"type,omitempty"`
+	}
+
+	firstImageModelID := func() string {
+		for _, model := range s.cfg.Models {
+			if model.Type == config.ModelTypeImage {
+				return model.ID
+			}
+		}
+		return ""
 	}
 
 	data := make([]modelItem, 0, len(s.models))
@@ -103,12 +115,14 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			Object:  "model",
 			Created: 0,
 			OwnedBy: "gpt2api-sidecar",
+			Type:    model.Type,
 		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"object": "list",
-		"data":   data,
+		"object":                 "list",
+		"data":                   data,
+		"default_image_model_id": firstImageModelID(),
 	})
 }
 
@@ -144,7 +158,11 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, req *http.Request
 		return
 	}
 	if body.Model == "" {
-		body.Model = s.cfg.Models[0].ID
+		body.Model = s.defaultImageModelID()
+		if body.Model == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "model_not_found", "配置中没有可用的 image 模型。")
+			return
+		}
 	}
 
 	if strings.TrimSpace(body.Prompt) == "" {
@@ -155,6 +173,11 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, req *http.Request
 	model, ok := s.models[body.Model]
 	if !ok {
 		writeOpenAIError(w, http.StatusBadRequest, "model_not_found", fmt.Sprintf("未知模型 %q。", body.Model))
+		return
+	}
+	if model.Type != config.ModelTypeImage {
+		writeOpenAIError(w, http.StatusBadRequest, "model_type_mismatch",
+			fmt.Sprintf("模型 %q 是 %s 类型，不能用于 /v1/images/generations。", body.Model, model.Type))
 		return
 	}
 
@@ -184,11 +207,20 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, req *http.Request) {
 
 	modelID := req.FormValue("model")
 	if modelID == "" {
-		modelID = s.cfg.Models[0].ID
+		modelID = s.defaultImageModelID()
+		if modelID == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "model_not_found", "配置中没有可用的 image 模型。")
+			return
+		}
 	}
 	model, ok := s.models[modelID]
 	if !ok {
 		writeOpenAIError(w, http.StatusBadRequest, "model_not_found", fmt.Sprintf("未知模型 %q。", modelID))
+		return
+	}
+	if model.Type != config.ModelTypeImage {
+		writeOpenAIError(w, http.StatusBadRequest, "model_type_mismatch",
+			fmt.Sprintf("模型 %q 是 %s 类型，不能用于 /v1/images/edits。", modelID, model.Type))
 		return
 	}
 
@@ -253,39 +285,89 @@ func (s *Server) generateImages(
 	defer queueLease.Release()
 
 	items := make([]imageResponseItem, 0, n)
-	runs := 0
-
-	for len(items) < n && runs < n {
-		runs++
-		requestTimeout, _ := s.cfg.RequestTimeoutDuration()
-		acquireTimeout, _ := s.cfg.AcquireTimeoutDuration()
-		runCtx, cancel := context.WithTimeout(ctx, requestTimeout)
-		result := s.runner.Run(runCtx, runner.Request{
-			Prompt:         prompt,
-			UpstreamModel:  model.Upstream,
-			References:     references,
-			MaxAttempts:    2,
-			AcquireTimeout: acquireTimeout,
-			MaxImageBytes:  s.cfg.Server.MaxImageBytes,
-		})
-		cancel()
-
-		if result.ErrorCode != "" {
-			return nil, &runnerError{
-				Code:    result.ErrorCode,
-				Message: result.ErrorMessage,
-			}
-		}
-
-		for _, image := range result.Images {
-			if len(items) >= n {
-				break
-			}
-			items = append(items, s.makeImageResponseItem(image, responseFormat))
-		}
+	jobCount := n
+	if jobCount <= 0 {
+		jobCount = 1
+	}
+	jobsCtx, cancelJobs := context.WithCancel(ctx)
+	defer cancelJobs()
+	results := make(chan imageJobResult, jobCount)
+	requestTimeout, _ := s.cfg.RequestTimeoutDuration()
+	acquireTimeout, _ := s.cfg.AcquireTimeoutDuration()
+	taskTimeout := requestTimeout
+	if taskTimeout <= 0 || taskTimeout > imageJobTimeout {
+		taskTimeout = imageJobTimeout
+	}
+	maxAttempts := 2
+	if len(references) > 0 {
+		maxAttempts = 1
 	}
 
+	for i := 0; i < jobCount; i++ {
+		go func(idx int) {
+			result := s.runner.Run(jobsCtx, runner.Request{
+				Prompt:         prompt,
+				UpstreamModel:  model.Upstream,
+				References:     references,
+				MaxAttempts:    maxAttempts,
+				AcquireTimeout: acquireTimeout,
+				TaskTimeout:    taskTimeout,
+				MaxImageBytes:  s.cfg.Server.MaxImageBytes,
+			})
+			if result.ErrorCode != "" {
+				code := result.ErrorCode
+				message := result.ErrorMessage
+				if code == runner.ErrPollTimeout && strings.Contains(strings.ToLower(message), "deadline exceeded") {
+					code = errImageTimeout
+					message = "no image returned within 3 minutes after an account was acquired"
+				}
+				results <- imageJobResult{
+					Index:        idx,
+					ErrorCode:    code,
+					ErrorMessage: message,
+				}
+				return
+			}
+			results <- imageJobResult{
+				Index:  idx,
+				Images: result.Images,
+			}
+		}(i)
+	}
+
+	var lastErr *runnerError
+	completed := 0
+	for completed < jobCount && len(items) < n {
+		select {
+		case result := <-results:
+			completed++
+			if result.ErrorCode != "" {
+				lastErr = &runnerError{Code: result.ErrorCode, Message: result.ErrorMessage}
+				logger.L().Warn("parallel image job failed",
+					zap.Int("job", result.Index+1),
+					zap.Int("jobs", jobCount),
+					zap.String("code", result.ErrorCode),
+					zap.String("message", result.ErrorMessage),
+				)
+				continue
+			}
+			for _, image := range result.Images {
+				if len(items) >= n {
+					break
+				}
+				items = append(items, s.makeImageResponseItem(image, responseFormat))
+			}
+		case <-ctx.Done():
+			cancelJobs()
+			return nil, &runnerError{Code: errImageTimeout, Message: ctx.Err().Error()}
+		}
+	}
+	cancelJobs()
+
 	if len(items) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
 		return nil, &runnerError{
 			Code:    runner.ErrDownload,
 			Message: "生成流程结束，但没有拿到任何图片字节。",
@@ -293,6 +375,22 @@ func (s *Server) generateImages(
 	}
 
 	return items, nil
+}
+
+type imageJobResult struct {
+	Index        int
+	Images       []runner.Image
+	ErrorCode    string
+	ErrorMessage string
+}
+
+func (s *Server) defaultImageModelID() string {
+	for _, model := range s.cfg.Models {
+		if model.Type == config.ModelTypeImage {
+			return model.ID
+		}
+	}
+	return ""
 }
 
 func (s *Server) acquireImageQueue(ctx context.Context) (*queue.Lease, error) {
@@ -552,6 +650,8 @@ func (s *Server) writeRunnerError(w http.ResponseWriter, err error) {
 		status = http.StatusServiceUnavailable
 	case runner.ErrAuthRequired:
 		status = http.StatusUnauthorized
+	case errImageTimeout:
+		status = http.StatusGatewayTimeout
 	case runner.ErrPreviewOnly, runner.ErrPollTimeout, runner.ErrDownload:
 		status = http.StatusBadGateway
 	}
@@ -598,6 +698,8 @@ func localizeImageError(code, message string) string {
 		return "Timed out while waiting for the final image result."
 	case runner.ErrDownload:
 		return "The image was generated, but downloading the bytes failed."
+	case errImageTimeout:
+		return "No image was returned within 3 minutes."
 	case errQueueFull:
 		return "The image request queue is full. Please retry shortly."
 	case errQueueTimeout:
