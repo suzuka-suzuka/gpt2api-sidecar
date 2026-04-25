@@ -499,6 +499,7 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 //   - 全程没拿到图才是 timeout
 type PollOpts struct {
 	BaselineToolIDs map[string]struct{} // 发送前已存在的 tool 消息 id,本次回合只看新增
+	IgnoreFileIDs   map[string]struct{} // 已知不是本轮输出的 file-service id,例如图生图输入参考图
 	ExpectedN       int                 // 期望返回的图片张数,够了立即短路,默认 1
 	MaxWait         time.Duration       // 总超时,默认 300s(上游渲染慢时兜底补齐)
 	Interval        time.Duration       // 轮询间隔,默认 3s
@@ -528,6 +529,7 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		opt.Interval = 3 * time.Second
 	}
 	baseline := opt.BaselineToolIDs
+	ignoreFile := opt.IgnoreFileIDs
 
 	deadline := time.Now().Add(opt.MaxWait)
 
@@ -579,6 +581,9 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 		// file-service 终稿,或同一条消息里带 N 张 file id;这里都累计起来。
 		for _, m := range newMsgs {
 			for _, f := range m.FileIDs {
+				if _, ignored := ignoreFile[f]; ignored {
+					continue
+				}
 				if _, ok := seenFile[f]; !ok {
 					seenFile[f] = struct{}{}
 					allFile = append(allFile, f)

@@ -3,7 +3,7 @@ server:
   public_base_url: http://127.0.0.1:46321
   log_level: info
   log_format: console
-  request_timeout: 8m
+  request_timeout: 3m
   queue_wait_timeout: 10m
   max_queue_size: 32
   acquire_timeout: 2m
@@ -17,11 +17,59 @@ auth:
     - sakura-sidecar-key
 
 models:
+  # Default image alias. "auto" is not returned by /backend-api/models; it asks
+  # chatgpt.com to route the picture_v2 request itself, and is usually safest
+  # for free accounts.
   - id: gpt-image-2
     upstream: auto
     type: image
-  - id: gpt-image-1
-    upstream: auto
+  # Real slugs observed from /backend-api/models. They are listed here as image
+  # models so callers can choose one directly on /v1/images/*; not every slug is
+  # guaranteed to produce images for every account.
+  - id: gpt-5-3
+    upstream: gpt-5-3
+    type: image
+  - id: gpt-5-3-instant
+    upstream: gpt-5-3-instant
+    type: image
+  - id: gpt-5-4-thinking
+    upstream: gpt-5-4-thinking
+    type: image
+  - id: gpt-5-5-thinking
+    upstream: gpt-5-5-thinking
+    type: image
+  - id: gpt-5-2
+    upstream: gpt-5-2
+    type: image
+  - id: gpt-5-2-instant
+    upstream: gpt-5-2-instant
+    type: image
+  - id: gpt-5-2-thinking
+    upstream: gpt-5-2-thinking
+    type: image
+  - id: gpt-5-1
+    upstream: gpt-5-1
+    type: image
+  - id: gpt-5
+    upstream: gpt-5
+    type: image
+  - id: gpt-5-mini
+    upstream: gpt-5-mini
+    type: image
+  - id: gpt-5-3-mini
+    upstream: gpt-5-3-mini
+    type: image
+  - id: gpt-5-4-t-mini
+    upstream: gpt-5-4-t-mini
+    type: image
+  - id: o3
+    upstream: o3
+    type: image
+  - id: research
+    upstream: research
+    type: image
+  - id: agent-mode
+    upstream: agent-mode
     type: image
 
 accounts:

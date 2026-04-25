@@ -16,17 +16,17 @@ import (
 )
 
 const (
-	ErrUnknown          = "unknown"
-	ErrNoAccount        = "no_available_account"
-	ErrAuthRequired     = "auth_required"
-	ErrRateLimited      = "rate_limited"
-	ErrNetworkTransient = "network_transient"
-	ErrPOWTimeout       = "pow_timeout"
-	ErrPOWFailed        = "pow_failed"
-	ErrPreviewOnly      = "preview_only"
-	ErrPollTimeout      = "poll_timeout"
-	ErrDownload         = "download_failed"
-	ErrUpstream         = "upstream_error"
+	ErrUnknown               = "unknown"
+	ErrNoAccount             = "no_available_account"
+	ErrAuthRequired          = "auth_required"
+	ErrRateLimited           = "rate_limited"
+	ErrNetworkTransient      = "network_transient"
+	ErrPOWTimeout            = "pow_timeout"
+	ErrPOWFailed             = "pow_failed"
+	ErrPreviewOnly           = "preview_only"
+	ErrPollTimeout           = "poll_timeout"
+	ErrDownload              = "download_failed"
+	ErrUpstream              = "upstream_error"
 	defaultTransientCooldown = 30 * time.Second
 )
 
@@ -41,6 +41,7 @@ type Request struct {
 	References     []ReferenceImage
 	MaxAttempts    int
 	AcquireTimeout time.Duration
+	TaskTimeout    time.Duration
 	PollMaxWait    time.Duration
 	MaxImageBytes  int64
 }
@@ -138,6 +139,13 @@ func (r *Runner) runOnce(ctx context.Context, req Request, result *Result) (bool
 	snap := lease.Snapshot()
 	result.AccountName = snap.Name
 
+	taskCtx := ctx
+	cancelTask := func() {}
+	if req.TaskTimeout > 0 {
+		taskCtx, cancelTask = context.WithTimeout(ctx, req.TaskTimeout)
+	}
+	defer cancelTask()
+
 	client, err := chatgpt.New(chatgpt.Options{
 		AuthToken: snap.AuthToken,
 		DeviceID:  snap.DeviceID,
@@ -149,12 +157,12 @@ func (r *Runner) runOnce(ctx context.Context, req Request, result *Result) (bool
 		return false, ErrUnknown, fmt.Errorf("create chatgpt client: %w", err)
 	}
 
-	refs, code, err := r.uploadReferences(ctx, client, snap.Name, req.References)
+	refs, code, err := r.uploadReferences(taskCtx, client, snap.Name, req.References)
 	if err != nil {
 		return false, code, err
 	}
 
-	res, code, err := r.runConversation(ctx, client, snap.Name, req, refs)
+	res, code, err := r.runConversation(taskCtx, client, snap.Name, req, refs)
 	if err != nil {
 		return false, code, err
 	}
@@ -187,6 +195,7 @@ func (r *Runner) runConversation(
 		fileRefs      []string
 		baselineTools = map[string]struct{}{}
 		isPreview     bool
+		inputFileIDs  = uploadedFileIDSet(refs)
 	)
 
 	for turn := 1; turn <= sameConvMax; turn++ {
@@ -253,7 +262,16 @@ func (r *Runner) runConversation(
 			zap.Int("sediment_refs", len(sseResult.SedimentIDs)),
 		)
 
-		fileRefs = append(fileRefs, sseResult.FileIDs...)
+		for _, fid := range sseResult.FileIDs {
+			if _, isInput := inputFileIDs[fid]; isInput {
+				logger.L().Warn("ignore echoed reference image from sse",
+					zap.String("account", accountName),
+					zap.String("file_id", fid),
+				)
+				continue
+			}
+			fileRefs = append(fileRefs, fid)
+		}
 		for _, sid := range sseResult.SedimentIDs {
 			fileRefs = append(fileRefs, "sed:"+sid)
 		}
@@ -264,6 +282,7 @@ func (r *Runner) runConversation(
 		status, fids, sids := client.PollConversationForImages(ctx, convID, chatgpt.PollOpts{
 			MaxWait:         req.PollMaxWait,
 			BaselineToolIDs: baselineTools,
+			IgnoreFileIDs:   inputFileIDs,
 			ExpectedN:       1,
 		})
 		switch status {
@@ -330,6 +349,17 @@ func (r *Runner) runConversation(
 		Images:         images,
 		IsPreview:      isPreview,
 	}, "", nil
+}
+
+func uploadedFileIDSet(files []*chatgpt.UploadedFile) map[string]struct{} {
+	out := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if file == nil || file.FileID == "" {
+			continue
+		}
+		out[file.FileID] = struct{}{}
+	}
+	return out
 }
 
 func (r *Runner) uploadReferences(
