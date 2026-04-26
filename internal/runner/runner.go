@@ -16,18 +16,17 @@ import (
 )
 
 const (
-	ErrUnknown               = "unknown"
-	ErrNoAccount             = "no_available_account"
-	ErrAuthRequired          = "auth_required"
-	ErrRateLimited           = "rate_limited"
-	ErrNetworkTransient      = "network_transient"
-	ErrPOWTimeout            = "pow_timeout"
-	ErrPOWFailed             = "pow_failed"
-	ErrPreviewOnly           = "preview_only"
-	ErrPollTimeout           = "poll_timeout"
-	ErrDownload              = "download_failed"
-	ErrUpstream              = "upstream_error"
-	defaultTransientCooldown = 30 * time.Second
+	ErrUnknown          = "unknown"
+	ErrNoAccount        = "no_available_account"
+	ErrAuthRequired     = "auth_required"
+	ErrRateLimited      = "rate_limited"
+	ErrNetworkTransient = "network_transient"
+	ErrPOWTimeout       = "pow_timeout"
+	ErrPOWFailed        = "pow_failed"
+	ErrPreviewOnly      = "preview_only"
+	ErrPollTimeout      = "poll_timeout"
+	ErrDownload         = "download_failed"
+	ErrUpstream         = "upstream_error"
 )
 
 type ReferenceImage struct {
@@ -39,7 +38,6 @@ type Request struct {
 	Prompt         string
 	UpstreamModel  string
 	References     []ReferenceImage
-	MaxAttempts    int
 	AcquireTimeout time.Duration
 	TaskTimeout    time.Duration
 	PollMaxWait    time.Duration
@@ -58,7 +56,6 @@ type Result struct {
 	IsPreview      bool
 	ErrorCode      string
 	ErrorMessage   string
-	Attempts       int
 }
 
 type Runner struct {
@@ -82,9 +79,6 @@ func (r *Runner) Run(ctx context.Context, req Request) *Result {
 	if req.UpstreamModel == "" {
 		req.UpstreamModel = "auto"
 	}
-	if req.MaxAttempts <= 0 {
-		req.MaxAttempts = 2
-	}
 	if req.PollMaxWait <= 0 {
 		req.PollMaxWait = 5 * time.Minute
 	}
@@ -93,27 +87,16 @@ func (r *Runner) Run(ctx context.Context, req Request) *Result {
 	}
 
 	result := &Result{ErrorCode: ErrUnknown}
-	for attempt := 1; attempt <= req.MaxAttempts; attempt++ {
-		result.Attempts = attempt
+	ok, code, err := r.runOnce(ctx, req, result)
+	if ok {
+		result.ErrorCode = ""
+		result.ErrorMessage = ""
+		return result
+	}
 
-		ok, code, err := r.runOnce(ctx, req, result)
-		if ok {
-			result.ErrorCode = ""
-			result.ErrorMessage = ""
-			return result
-		}
-
-		result.ErrorCode = code
-		if err != nil {
-			result.ErrorMessage = err.Error()
-		}
-
-		retryable := code == ErrPreviewOnly || code == ErrRateLimited ||
-			code == ErrAuthRequired || code == ErrNetworkTransient ||
-			code == ErrPollTimeout || code == ErrDownload || code == ErrUpstream
-		if !retryable {
-			return result
-		}
+	result.ErrorCode = code
+	if err != nil {
+		result.ErrorMessage = err.Error()
 	}
 
 	return result
@@ -186,108 +169,90 @@ func (r *Runner) runConversation(
 	req Request,
 	refs []*chatgpt.UploadedFile,
 ) (*conversationResult, string, error) {
-	const sameConvMax = 3
-
 	var (
-		convID        string
-		parentID      = uuid.NewString()
-		messageID     = uuid.NewString()
-		fileRefs      []string
-		baselineTools = map[string]struct{}{}
-		isPreview     bool
-		inputFileIDs  = uploadedFileIDSet(refs)
+		convID       string
+		parentID     = uuid.NewString()
+		messageID    = uuid.NewString()
+		fileRefs     []string
+		isPreview    bool
+		inputFileIDs = uploadedFileIDSet(refs)
 	)
 
-	for turn := 1; turn <= sameConvMax; turn++ {
-		cr, proofToken, code, err := r.getRequirements(ctx, client, accountName)
-		if err != nil {
-			return nil, code, err
-		}
+	cr, proofToken, code, err := r.getRequirements(ctx, client, accountName)
+	if err != nil {
+		return nil, code, err
+	}
 
-		convOpt := chatgpt.ImageConvOpts{
-			Prompt:        req.Prompt,
-			UpstreamModel: req.UpstreamModel,
-			ConvID:        convID,
-			ParentMsgID:   parentID,
-			MessageID:     messageID,
-			ChatToken:     cr.Token,
-			ProofToken:    proofToken,
-			References:    refs,
-		}
-		if turn > 1 {
-			convOpt.MessageID = uuid.NewString()
-		}
+	convOpt := chatgpt.ImageConvOpts{
+		Prompt:        req.Prompt,
+		UpstreamModel: req.UpstreamModel,
+		ConvID:        convID,
+		ParentMsgID:   parentID,
+		MessageID:     messageID,
+		ChatToken:     cr.Token,
+		ProofToken:    proofToken,
+		References:    refs,
+	}
 
-		if conduitToken, err := client.PrepareFConversation(ctx, convOpt); err == nil {
-			convOpt.ConduitToken = conduitToken
-		} else {
-			code := r.classifyUpstream(err)
-			if code == ErrRateLimited {
-				r.pool.MarkRateLimited(accountName, r.cooldown429)
-			}
-			if code == ErrAuthRequired {
-				r.pool.MarkUnauthorized(accountName)
-			}
-			if code == ErrNetworkTransient || code == ErrUpstream {
-				r.markTransientFailure(accountName)
-			}
-			return nil, code, err
+	if conduitToken, err := client.PrepareFConversation(ctx, convOpt); err == nil {
+		convOpt.ConduitToken = conduitToken
+	} else {
+		code := r.classifyUpstream(err)
+		if code == ErrRateLimited {
+			r.pool.MarkRateLimited(accountName, r.cooldown429)
 		}
+		if code == ErrAuthRequired {
+			r.pool.MarkUnauthorized(accountName)
+		}
+		return nil, code, err
+	}
 
-		stream, err := client.StreamFConversation(ctx, convOpt)
-		if err != nil {
-			code := r.classifyUpstream(err)
-			if code == ErrRateLimited {
-				r.pool.MarkRateLimited(accountName, r.cooldown429)
-			}
-			if code == ErrAuthRequired {
-				r.pool.MarkUnauthorized(accountName)
-			}
-			if code == ErrNetworkTransient || code == ErrUpstream {
-				r.markTransientFailure(accountName)
-			}
-			return nil, code, err
+	stream, err := client.StreamFConversation(ctx, convOpt)
+	if err != nil {
+		code := r.classifyUpstream(err)
+		if code == ErrRateLimited {
+			r.pool.MarkRateLimited(accountName, r.cooldown429)
 		}
+		if code == ErrAuthRequired {
+			r.pool.MarkUnauthorized(accountName)
+		}
+		return nil, code, err
+	}
 
-		sseResult := chatgpt.ParseImageSSE(stream)
-		if sseResult.ConversationID != "" {
-			convID = sseResult.ConversationID
-		}
+	sseResult := chatgpt.ParseImageSSE(stream)
+	if sseResult.ConversationID != "" {
+		convID = sseResult.ConversationID
+	}
 
-		logger.L().Info("sidecar image sse parsed",
-			zap.String("account", accountName),
-			zap.Int("turn", turn),
-			zap.String("conversation_id", convID),
-			zap.Int("file_refs", len(sseResult.FileIDs)),
-			zap.Int("sediment_refs", len(sseResult.SedimentIDs)),
-		)
+	logger.L().Info("sidecar image sse parsed",
+		zap.String("account", accountName),
+		zap.String("conversation_id", convID),
+		zap.Int("file_refs", len(sseResult.FileIDs)),
+		zap.Int("sediment_refs", len(sseResult.SedimentIDs)),
+	)
 
-		for _, fid := range sseResult.FileIDs {
-			if _, isInput := inputFileIDs[fid]; isInput {
-				logger.L().Warn("ignore echoed reference image from sse",
-					zap.String("account", accountName),
-					zap.String("file_id", fid),
-				)
-				continue
-			}
-			fileRefs = append(fileRefs, fid)
+	for _, fid := range sseResult.FileIDs {
+		if _, isInput := inputFileIDs[fid]; isInput {
+			logger.L().Warn("ignore echoed reference image from sse",
+				zap.String("account", accountName),
+				zap.String("file_id", fid),
+			)
+			continue
 		}
-		for _, sid := range sseResult.SedimentIDs {
-			fileRefs = append(fileRefs, "sed:"+sid)
-		}
-		if len(fileRefs) > 0 {
-			break
-		}
+		fileRefs = append(fileRefs, fid)
+	}
+	for _, sid := range sseResult.SedimentIDs {
+		fileRefs = append(fileRefs, "sed:"+sid)
+	}
 
+	if len(fileRefs) == 0 {
 		status, fids, sids := client.PollConversationForImages(ctx, convID, chatgpt.PollOpts{
-			MaxWait:         req.PollMaxWait,
-			BaselineToolIDs: baselineTools,
-			IgnoreFileIDs:   inputFileIDs,
-			ExpectedN:       1,
+			MaxWait:       req.PollMaxWait,
+			IgnoreFileIDs: inputFileIDs,
+			ExpectedN:     1,
 		})
 		logger.L().Info("sidecar image poll done",
 			zap.String("account", accountName),
-			zap.Int("turn", turn),
 			zap.String("conversation_id", convID),
 			zap.String("status", string(status)),
 			zap.Int("file_refs", len(fids)),
@@ -299,27 +264,19 @@ func (r *Runner) runConversation(
 			for _, sid := range sids {
 				fileRefs = append(fileRefs, "sed:"+sid)
 			}
-			break
 
 		case chatgpt.PollStatusTimeout:
-			r.markTransientFailure(accountName)
 			if ctx.Err() != nil {
 				return nil, ErrPollTimeout, fmt.Errorf("poll timeout: %w", ctx.Err())
 			}
 			return nil, ErrPollTimeout, errors.New("poll timeout")
 
 		default:
-			r.markTransientFailure(accountName)
 			return nil, ErrUpstream, errors.New("poll returned error")
-		}
-
-		if len(fileRefs) > 0 {
-			break
 		}
 	}
 
 	if len(fileRefs) == 0 {
-		r.markTransientFailure(accountName)
 		return nil, ErrPollTimeout, errors.New("no image refs produced")
 	}
 
@@ -351,7 +308,6 @@ func (r *Runner) runConversation(
 		})
 	}
 	if len(images) == 0 {
-		r.markTransientFailure(accountName)
 		return nil, ErrDownload, errors.New("all image downloads failed")
 	}
 
@@ -385,42 +341,14 @@ func (r *Runner) uploadReferences(
 
 	out := make([]*chatgpt.UploadedFile, 0, len(references))
 	for idx, ref := range references {
-		var (
-			uploaded *chatgpt.UploadedFile
-			err      error
-			code     string
-		)
-		for attempt := 1; attempt <= 3; attempt++ {
-			uploaded, err = client.UploadFile(ctx, ref.Data, ref.FileName)
-			if err == nil {
-				break
-			}
-
-			code = r.classifyUpstream(err)
-			if code != ErrNetworkTransient || ctx.Err() != nil || attempt == 3 {
-				break
-			}
-
-			logger.L().Warn("sidecar upload reference transient failure, retrying",
-				zap.String("account", accountName),
-				zap.Int("reference", idx+1),
-				zap.Int("attempt", attempt),
-				zap.Error(err),
-			)
-			sleepContext(ctx, time.Duration(attempt)*500*time.Millisecond)
-		}
+		uploaded, err := client.UploadFile(ctx, ref.Data, ref.FileName)
 		if err != nil {
-			if code == "" {
-				code = r.classifyUpstream(err)
-			}
+			code := r.classifyUpstream(err)
 			if code == ErrRateLimited {
 				r.pool.MarkRateLimited(accountName, r.cooldown429)
 			}
 			if code == ErrAuthRequired {
 				r.pool.MarkUnauthorized(accountName)
-			}
-			if code == ErrNetworkTransient || code == ErrUpstream {
-				r.markTransientFailure(accountName)
 			}
 			return nil, code, fmt.Errorf("upload reference %d: %w", idx+1, err)
 		}
@@ -428,15 +356,6 @@ func (r *Runner) uploadReferences(
 	}
 
 	return out, "", nil
-}
-
-func sleepContext(ctx context.Context, d time.Duration) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
 }
 
 func (r *Runner) getRequirements(
@@ -452,9 +371,6 @@ func (r *Runner) getRequirements(
 		}
 		if code == ErrAuthRequired {
 			r.pool.MarkUnauthorized(accountName)
-		}
-		if code == ErrNetworkTransient || code == ErrUpstream {
-			r.markTransientFailure(accountName)
 		}
 		return nil, "", code, err
 	}
@@ -486,27 +402,6 @@ func (r *Runner) getRequirements(
 	}
 
 	return cr, proofToken, "", nil
-}
-
-func (r *Runner) markTransientFailure(accountName string) {
-	cooldown := time.Duration(defaultTransientCooldown)
-	if r.cooldown429 > 0 && r.cooldown429 < cooldown {
-		cooldown = r.cooldown429
-	}
-	r.pool.MarkCooldown(accountName, cooldown)
-}
-
-func buildToolBaseline(mapping map[string]interface{}) map[string]struct{} {
-	tools := chatgpt.ExtractImageToolMsgs(mapping)
-	if len(tools) == 0 {
-		return nil
-	}
-
-	out := make(map[string]struct{}, len(tools))
-	for _, tool := range tools {
-		out[tool.MessageID] = struct{}{}
-	}
-	return out
 }
 
 func (r *Runner) classifyUpstream(err error) string {
