@@ -298,10 +298,6 @@ func (s *Server) generateImages(
 	if taskTimeout <= 0 {
 		taskTimeout = imageJobTimeout
 	}
-	maxAttempts := 2
-	if len(references) > 0 {
-		maxAttempts = 1
-	}
 
 	for i := 0; i < jobCount; i++ {
 		go func(idx int) {
@@ -309,7 +305,6 @@ func (s *Server) generateImages(
 				Prompt:         prompt,
 				UpstreamModel:  model.Upstream,
 				References:     references,
-				MaxAttempts:    maxAttempts,
 				AcquireTimeout: acquireTimeout,
 				TaskTimeout:    taskTimeout,
 				MaxImageBytes:  s.cfg.Server.MaxImageBytes,
