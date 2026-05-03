@@ -51,3 +51,21 @@ func TestRetryableNoImageTaskSkipsPlainRateLimit(t *testing.T) {
 		t.Fatal("did not expect plain rate limit to be retryable")
 	}
 }
+
+func TestImageTaskNotStartedWhenNoUsableRefsOrTaskID(t *testing.T) {
+	if !imageTaskNotStarted(nil, "") {
+		t.Fatal("expected missing usable refs and task id to be treated as not started")
+	}
+}
+
+func TestImageTaskStartedWhenTaskIDExists(t *testing.T) {
+	if imageTaskNotStarted(nil, "task_123") {
+		t.Fatal("expected task id to keep polling even without immediate refs")
+	}
+}
+
+func TestImageTaskStartedWhenUsableRefsExist(t *testing.T) {
+	if imageTaskNotStarted([]string{"sed:final_ref"}, "") {
+		t.Fatal("expected usable refs to be treated as started")
+	}
+}

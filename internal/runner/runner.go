@@ -168,6 +168,10 @@ func retryableNoImageTask(code string, err error) bool {
 		cooldownErr.reason == "no_image_task"
 }
 
+func imageTaskNotStarted(fileRefs []string, imageGenTaskID string) bool {
+	return len(fileRefs) == 0 && strings.TrimSpace(imageGenTaskID) == ""
+}
+
 func (r *Runner) runOnce(ctx context.Context, req Request, result *Result) (bool, string, error) {
 	acquireCtx := ctx
 	cancel := func() {}
@@ -325,13 +329,16 @@ func (r *Runner) runConversation(
 		fileRefs = append(fileRefs, "sed:"+sid)
 	}
 
-	if len(fileRefs) == 0 && len(sseResult.FileIDs) == 0 && len(sseResult.SedimentIDs) == 0 && strings.TrimSpace(sseResult.ImageGenTaskID) == "" {
+	if imageTaskNotStarted(fileRefs, sseResult.ImageGenTaskID) {
 		logger.L().Warn("sidecar image task not started",
 			zap.String("account", accountName),
 			zap.String("persona", cr.Persona),
 			zap.String("conversation_id", convID),
 			zap.String("finish_type", sseResult.FinishType),
 			zap.Bool("image_edit", isEdit),
+			zap.Int("raw_file_refs", len(sseResult.FileIDs)),
+			zap.Int("raw_sediment_refs", len(sseResult.SedimentIDs)),
+			zap.Int("usable_file_refs", len(fileRefs)),
 		)
 		if err := r.recordNoImageFailure(accountName, cr.Persona, convID, "no_image_task"); err != nil {
 			return nil, ErrRateLimited, err
