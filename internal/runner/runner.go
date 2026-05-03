@@ -112,12 +112,31 @@ func (r *Runner) Run(ctx context.Context, req Request) *Result {
 		req.MaxImageBytes = requestLimit
 	}
 
-	result := &Result{ErrorCode: ErrUnknown}
-	ok, code, err := r.runOnce(ctx, req, result)
-	if ok {
-		result.ErrorCode = ""
-		result.ErrorMessage = ""
-		return result
+	var (
+		result *Result
+		code   string
+		err    error
+	)
+	for attempt := 1; attempt <= 2; attempt++ {
+		result = &Result{ErrorCode: ErrUnknown}
+		ok, attemptCode, attemptErr := r.runOnce(ctx, req, result)
+		if ok {
+			result.ErrorCode = ""
+			result.ErrorMessage = ""
+			return result
+		}
+
+		code = attemptCode
+		err = attemptErr
+		if attempt == 1 && retryableNoImageTask(code, err) {
+			logger.L().Warn("retry image request after no-image task failure",
+				zap.String("account", result.AccountName),
+				zap.String("code", code),
+				zap.Error(err),
+			)
+			continue
+		}
+		break
 	}
 
 	result.ErrorCode = code
@@ -126,6 +145,27 @@ func (r *Runner) Run(ctx context.Context, req Request) *Result {
 	}
 
 	return result
+}
+
+type noImageFailureCooldownError struct {
+	reason string
+	policy pool.NoImageFailurePolicy
+}
+
+func (e *noImageFailureCooldownError) Error() string {
+	return fmt.Sprintf("no image returned %d time(s) within %s for %s account; account cooled down for %s",
+		e.policy.Count, e.policy.Window, e.policy.Plan, e.policy.Cooldown)
+}
+
+func retryableNoImageTask(code string, err error) bool {
+	if code == ErrNoImageTask {
+		return true
+	}
+
+	var cooldownErr *noImageFailureCooldownError
+	return code == ErrRateLimited &&
+		errors.As(err, &cooldownErr) &&
+		cooldownErr.reason == "no_image_task"
 }
 
 func (r *Runner) runOnce(ctx context.Context, req Request, result *Result) (bool, string, error) {
@@ -288,10 +328,14 @@ func (r *Runner) runConversation(
 	if len(fileRefs) == 0 && len(sseResult.FileIDs) == 0 && len(sseResult.SedimentIDs) == 0 && strings.TrimSpace(sseResult.ImageGenTaskID) == "" {
 		logger.L().Warn("sidecar image task not started",
 			zap.String("account", accountName),
+			zap.String("persona", cr.Persona),
 			zap.String("conversation_id", convID),
 			zap.String("finish_type", sseResult.FinishType),
 			zap.Bool("image_edit", isEdit),
 		)
+		if err := r.recordNoImageFailure(accountName, cr.Persona, convID, "no_image_task"); err != nil {
+			return nil, ErrRateLimited, err
+		}
 		return nil, ErrNoImageTask, errors.New("upstream did not start an image generation task")
 	}
 
@@ -318,6 +362,9 @@ func (r *Runner) runConversation(
 			}
 
 		case chatgpt.PollStatusTimeout:
+			if err := r.recordNoImageFailure(accountName, cr.Persona, convID, "poll_timeout"); err != nil {
+				return nil, ErrRateLimited, err
+			}
 			if isEdit && len(sseResult.SedimentIDs) > 0 && len(fids)+len(sids) == 0 {
 				return nil, ErrPreviewOnly, errors.New("only initial sediment preview refs returned; no final image ref")
 			}
@@ -332,6 +379,9 @@ func (r *Runner) runConversation(
 	}
 
 	if len(fileRefs) == 0 {
+		if err := r.recordNoImageFailure(accountName, cr.Persona, convID, "no_image_refs"); err != nil {
+			return nil, ErrRateLimited, err
+		}
 		return nil, ErrPollTimeout, errors.New("no image refs produced")
 	}
 
@@ -404,6 +454,33 @@ func referenceImageHashes(references []ReferenceImage) map[[32]byte]struct{} {
 	return out
 }
 
+func (r *Runner) recordNoImageFailure(accountName, persona, conversationID, reason string) error {
+	result := r.pool.RecordNoImageFailure(accountName, persona)
+	fields := []zap.Field{
+		zap.String("account", accountName),
+		zap.String("persona", result.Persona),
+		zap.String("plan", result.Plan),
+		zap.String("conversation_id", conversationID),
+		zap.String("reason", reason),
+		zap.Int("count", result.Count),
+		zap.Int("threshold", result.Threshold),
+		zap.Duration("window", result.Window),
+		zap.Duration("cooldown", result.Cooldown),
+		zap.Bool("cooldown_applied", result.CooldownApplied),
+	}
+	if !result.CooldownUntil.IsZero() {
+		fields = append(fields, zap.Time("cooldown_until", result.CooldownUntil))
+	}
+	logger.L().Warn("sidecar no-image failure recorded", fields...)
+	if !result.CooldownApplied {
+		return nil
+	}
+	return &noImageFailureCooldownError{
+		reason: reason,
+		policy: result,
+	}
+}
+
 func (r *Runner) uploadReferences(
 	ctx context.Context,
 	client *chatgpt.Client,
@@ -449,6 +526,7 @@ func (r *Runner) getRequirements(
 		}
 		return nil, "", code, err
 	}
+	r.pool.MarkPersona(accountName, cr.Persona)
 
 	var proofToken string
 	if cr.Proofofwork.Required {

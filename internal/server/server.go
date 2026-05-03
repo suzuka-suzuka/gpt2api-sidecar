@@ -740,8 +740,10 @@ func (s *Server) writeRunnerError(w http.ResponseWriter, err error) {
 
 	status := http.StatusBadGateway
 	switch imageErr.Code {
-	case runner.ErrNoAccount, runner.ErrRateLimited, runner.ErrNetworkTransient, errQueueFull, errQueueTimeout:
+	case runner.ErrNoAccount, runner.ErrNetworkTransient, errQueueFull, errQueueTimeout:
 		status = http.StatusServiceUnavailable
+	case runner.ErrRateLimited:
+		status = http.StatusTooManyRequests
 	case runner.ErrAuthRequired:
 		status = http.StatusUnauthorized
 	case runner.ErrNoImageTask:
