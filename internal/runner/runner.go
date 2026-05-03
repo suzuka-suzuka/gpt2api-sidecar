@@ -25,6 +25,7 @@ const (
 	ErrNetworkTransient = "network_transient"
 	ErrPOWTimeout       = "pow_timeout"
 	ErrPOWFailed        = "pow_failed"
+	ErrNoImageTask      = "no_image_task"
 	ErrPreviewOnly      = "preview_only"
 	ErrPollTimeout      = "poll_timeout"
 	ErrDownload         = "download_failed"
@@ -256,6 +257,8 @@ func (r *Runner) runConversation(
 		zap.String("conversation_id", convID),
 		zap.Int("file_refs", len(sseResult.FileIDs)),
 		zap.Int("sediment_refs", len(sseResult.SedimentIDs)),
+		zap.String("image_gen_task_id", sseResult.ImageGenTaskID),
+		zap.String("finish_type", sseResult.FinishType),
 		zap.Bool("image_edit", isEdit),
 	)
 
@@ -280,6 +283,16 @@ func (r *Runner) runConversation(
 			continue
 		}
 		fileRefs = append(fileRefs, "sed:"+sid)
+	}
+
+	if len(fileRefs) == 0 && len(sseResult.FileIDs) == 0 && len(sseResult.SedimentIDs) == 0 && strings.TrimSpace(sseResult.ImageGenTaskID) == "" {
+		logger.L().Warn("sidecar image task not started",
+			zap.String("account", accountName),
+			zap.String("conversation_id", convID),
+			zap.String("finish_type", sseResult.FinishType),
+			zap.Bool("image_edit", isEdit),
+		)
+		return nil, ErrNoImageTask, errors.New("upstream did not start an image generation task")
 	}
 
 	if len(fileRefs) == 0 {

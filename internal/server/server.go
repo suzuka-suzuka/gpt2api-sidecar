@@ -744,6 +744,8 @@ func (s *Server) writeRunnerError(w http.ResponseWriter, err error) {
 		status = http.StatusServiceUnavailable
 	case runner.ErrAuthRequired:
 		status = http.StatusUnauthorized
+	case runner.ErrNoImageTask:
+		status = http.StatusBadRequest
 	case errImageTimeout:
 		status = http.StatusGatewayTimeout
 	case runner.ErrPreviewOnly, runner.ErrPollTimeout, runner.ErrDownload:
@@ -786,6 +788,8 @@ func localizeImageError(code, message string) string {
 		return "A transient upstream network error occurred. Please retry shortly."
 	case runner.ErrAuthRequired:
 		return "Account authentication failed and the account was disabled."
+	case runner.ErrNoImageTask:
+		return "Upstream did not start an image generation task."
 	case runner.ErrPreviewOnly:
 		return "Only a preview result was returned."
 	case runner.ErrPollTimeout:
