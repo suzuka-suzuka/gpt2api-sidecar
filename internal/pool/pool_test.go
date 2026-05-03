@@ -1,6 +1,8 @@
 package pool
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -71,5 +73,39 @@ func TestRecordNoImageFailureDropsOldFailures(t *testing.T) {
 	}
 	if third.CooldownApplied {
 		t.Fatal("did not expect cooldown before three paid-account failures within 24h")
+	}
+}
+
+func TestCooldownUsesSharedStateStore(t *testing.T) {
+	store := NewMemoryStateStore()
+	p1 := NewWithStore([]config.AccountConfig{{Name: "account", AuthToken: "token"}}, 0, store)
+	p1.MarkCooldown("account", time.Hour)
+
+	p2 := NewWithStore([]config.AccountConfig{{Name: "account", AuthToken: "token"}}, 0, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	_, err := p2.Acquire(ctx)
+	if !errors.Is(err, ErrNoAvailable) {
+		t.Fatalf("Acquire error = %v, want %v", err, ErrNoAvailable)
+	}
+}
+
+func TestNoImageFailureCountUsesSharedStateStore(t *testing.T) {
+	store := NewMemoryStateStore()
+	now := time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+
+	p1 := NewWithStore([]config.AccountConfig{{Name: "paid", AuthToken: "token"}}, 0, store)
+	p1.recordNoImageFailureAt("paid", personaChatGPTPaid, now)
+	p1.recordNoImageFailureAt("paid", personaChatGPTPaid, now.Add(time.Hour))
+
+	p2 := NewWithStore([]config.AccountConfig{{Name: "paid", AuthToken: "token"}}, 0, store)
+	third := p2.recordNoImageFailureAt("paid", personaChatGPTPaid, now.Add(2*time.Hour))
+
+	if third.Count != 3 {
+		t.Fatalf("third count = %d, want 3 from shared state store", third.Count)
+	}
+	if !third.CooldownApplied {
+		t.Fatal("expected third shared no-image failure to apply cooldown")
 	}
 }

@@ -31,13 +31,10 @@ type AccountState struct {
 }
 
 type account struct {
-	snapshot        Snapshot
-	persona         string
-	noImageFailures []time.Time
-	busy            bool
-	disabled        bool
-	lastUsedAt      time.Time
-	cooldownUntil   time.Time
+	snapshot   Snapshot
+	busy       bool
+	disabled   bool
+	lastUsedAt time.Time
 }
 
 type Pool struct {
@@ -45,6 +42,7 @@ type Pool struct {
 	accounts    []*account
 	minInterval time.Duration
 	nextIndex   int
+	state       StateStore
 }
 
 type Lease struct {
@@ -81,6 +79,13 @@ const (
 )
 
 func New(accounts []config.AccountConfig, minInterval time.Duration) *Pool {
+	return NewWithStore(accounts, minInterval, nil)
+}
+
+func NewWithStore(accounts []config.AccountConfig, minInterval time.Duration, state StateStore) *Pool {
+	if state == nil {
+		state = NewMemoryStateStore()
+	}
 	items := make([]*account, 0, len(accounts))
 	for _, cfg := range accounts {
 		if cfg.Enabled != nil && !*cfg.Enabled {
@@ -100,6 +105,7 @@ func New(accounts []config.AccountConfig, minInterval time.Duration) *Pool {
 	return &Pool{
 		accounts:    items,
 		minInterval: minInterval,
+		state:       state,
 	}
 }
 
@@ -137,9 +143,7 @@ func (p *Pool) Reload(accounts []config.AccountConfig, minInterval time.Duration
 			acc.snapshot = snap
 			if authChanged {
 				acc.disabled = false
-				acc.cooldownUntil = time.Time{}
-				acc.persona = ""
-				acc.noImageFailures = nil
+				_ = p.state.ClearAccount(context.Background(), cfg.Name)
 			}
 			items = append(items, acc)
 			continue
@@ -170,7 +174,11 @@ func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
 			if acc.disabled || acc.busy {
 				continue
 			}
-			if !acc.cooldownUntil.IsZero() && now.Before(acc.cooldownUntil) {
+			cooldownUntil, err := p.state.CooldownUntil(context.Background(), acc.snapshot.Name)
+			if err != nil {
+				continue
+			}
+			if !cooldownUntil.IsZero() && now.Before(cooldownUntil) {
 				continue
 			}
 			if !acc.lastUsedAt.IsZero() && now.Sub(acc.lastUsedAt) < p.minInterval {
@@ -237,9 +245,7 @@ func (p *Pool) MarkCooldown(name string, cooldown time.Duration) {
 	until := time.Now().Add(cooldown)
 	for _, acc := range p.accounts {
 		if acc.snapshot.Name == name {
-			if until.After(acc.cooldownUntil) {
-				acc.cooldownUntil = until
-			}
+			_, _ = p.state.MarkCooldown(context.Background(), name, until)
 			return
 		}
 	}
@@ -254,7 +260,7 @@ func (p *Pool) MarkPersona(name, persona string) {
 	defer p.mu.Unlock()
 	for _, acc := range p.accounts {
 		if acc.snapshot.Name == name {
-			acc.persona = persona
+			_ = p.state.SetPersona(context.Background(), name, persona)
 			return
 		}
 	}
@@ -278,36 +284,30 @@ func (p *Pool) recordNoImageFailureAt(name, persona string, now time.Time) NoIma
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	cutoff := now.Add(-noImageFailureWindow)
 	for _, acc := range p.accounts {
 		if acc.snapshot.Name != name {
 			continue
 		}
 		if persona != "" {
-			acc.persona = persona
-		} else if acc.persona != "" {
-			result.Persona = acc.persona
-			plan, threshold, cooldown = noImagePolicy(acc.persona)
+			_ = p.state.SetPersona(context.Background(), name, persona)
+		} else if storedPersona, err := p.state.Persona(context.Background(), name); err == nil && storedPersona != "" {
+			result.Persona = storedPersona
+			plan, threshold, cooldown = noImagePolicy(storedPersona)
 			result.Plan = plan
 			result.Threshold = threshold
 			result.Cooldown = cooldown
 		}
 
-		filtered := acc.noImageFailures[:0]
-		for _, at := range acc.noImageFailures {
-			if at.After(cutoff) {
-				filtered = append(filtered, at)
-			}
+		count, err := p.state.RecordNoImageFailure(context.Background(), name, now, noImageFailureWindow)
+		if err != nil {
+			return result
 		}
-		acc.noImageFailures = append(filtered, now)
-		result.Count = len(acc.noImageFailures)
+		result.Count = count
 		if result.Count >= threshold && cooldown > 0 {
 			until := now.Add(cooldown)
-			if until.After(acc.cooldownUntil) {
-				acc.cooldownUntil = until
-			}
+			storedUntil, _ := p.state.MarkCooldown(context.Background(), name, until)
 			result.CooldownApplied = true
-			result.CooldownUntil = acc.cooldownUntil
+			result.CooldownUntil = storedUntil
 		}
 		return result
 	}
@@ -342,22 +342,18 @@ func (p *Pool) States() []AccountState {
 	defer p.mu.Unlock()
 
 	now := time.Now()
-	cutoff := now.Add(-noImageFailureWindow)
 	out := make([]AccountState, 0, len(p.accounts))
 	for _, acc := range p.accounts {
-		noImageFailures := 0
-		for _, at := range acc.noImageFailures {
-			if at.After(cutoff) {
-				noImageFailures++
-			}
-		}
+		persona, _ := p.state.Persona(context.Background(), acc.snapshot.Name)
+		cooldownUntil, _ := p.state.CooldownUntil(context.Background(), acc.snapshot.Name)
+		noImageFailures, _ := p.state.NoImageFailureCount(context.Background(), acc.snapshot.Name, now, noImageFailureWindow)
 		out = append(out, AccountState{
 			Name:               acc.snapshot.Name,
-			Persona:            acc.persona,
+			Persona:            persona,
 			NoImageFailures24h: noImageFailures,
 			Busy:               acc.busy,
 			Disabled:           acc.disabled,
-			CooldownUntil:      acc.cooldownUntil,
+			CooldownUntil:      cooldownUntil,
 			LastUsedAt:         acc.lastUsedAt,
 		})
 	}

@@ -13,6 +13,7 @@ import (
 
 type Config struct {
 	Server   ServerConfig    `yaml:"server"`
+	Redis    RedisConfig     `yaml:"redis"`
 	Auth     AuthConfig      `yaml:"auth"`
 	Models   []ModelConfig   `yaml:"models"`
 	Accounts []AccountConfig `yaml:"accounts"`
@@ -35,6 +36,13 @@ type ServerConfig struct {
 
 type AuthConfig struct {
 	APIKeys []string `yaml:"api_keys"`
+}
+
+type RedisConfig struct {
+	Addr      string `yaml:"addr"`
+	Password  string `yaml:"password"`
+	DB        int    `yaml:"db"`
+	KeyPrefix string `yaml:"key_prefix"`
 }
 
 const (
@@ -120,6 +128,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Server.MaxImageBytes <= 0 {
 		c.Server.MaxImageBytes = 16 * 1024 * 1024
+	}
+	if c.Redis.Addr == "" {
+		c.Redis.Addr = "127.0.0.1:6379"
+	}
+	if c.Redis.KeyPrefix == "" {
+		c.Redis.KeyPrefix = "gpt2api-sidecar"
 	}
 
 	for i := range c.Models {

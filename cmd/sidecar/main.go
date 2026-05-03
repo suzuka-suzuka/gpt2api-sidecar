@@ -48,7 +48,28 @@ func main() {
 		panic(err)
 	}
 
-	accountPool := pool.New(cfg.Accounts, minInterval)
+	stateStore := pool.StateStore(pool.NewMemoryStateStore())
+	if redisStore, err := pool.NewRedisStateStore(context.Background(), pool.RedisOptions{
+		Addr:      cfg.Redis.Addr,
+		Password:  cfg.Redis.Password,
+		DB:        cfg.Redis.DB,
+		KeyPrefix: cfg.Redis.KeyPrefix,
+	}); err != nil {
+		logger.L().Warn("redis state store unavailable; falling back to in-memory account state",
+			zap.String("addr", cfg.Redis.Addr),
+			zap.Error(err),
+		)
+	} else {
+		defer redisStore.Close()
+		stateStore = redisStore
+		logger.L().Info("redis state store connected",
+			zap.String("addr", cfg.Redis.Addr),
+			zap.Int("db", cfg.Redis.DB),
+			zap.String("key_prefix", cfg.Redis.KeyPrefix),
+		)
+	}
+
+	accountPool := pool.NewWithStore(cfg.Accounts, minInterval, stateStore)
 	imageRunner := runner.New(accountPool, cooldown429, cfg.Server.MaxImageBytes)
 	sidecarServer := server.New(cfg, *configPath, accountPool, imageRunner, blobTTL)
 
