@@ -246,13 +246,39 @@ curl http://127.0.0.1:46321/v1/models \
 
 `/healthz` now includes `queue.limit`, `queue.active`, and `queue.pending` so you can monitor current image queue pressure.
 
+## 配置热加载
+
+运行中修改 `config.yaml` 后，下一次 HTTP 请求会自动检查文件修改时间并热加载配置；不需要手动重启。
+
+可热加载的内容包括：
+
+- `auth.api_keys`
+- `models`
+- `accounts`、`enabled`、`auth_token`、`cookies`、`proxy_url`
+- `server.public_base_url`
+- `server.request_timeout`
+- `server.queue_wait_timeout`
+- `server.max_queue_size`
+- `server.acquire_timeout`
+- `server.min_interval`
+- `server.cooldown_429`
+- `server.blob_ttl`
+- `server.max_image_bytes`
+
+仍然需要重启的内容：
+
+- `server.listen`
+- `server.log_level`
+- `server.log_format`
+
+如果热加载失败，sidecar 会在日志里记录错误并继续使用上一份有效配置。
+
 ## 当前边界
 
 - 目前只做图片接口
 - `POST /v1/chat/completions` 仍然返回 `501`
 - 单个出图子任务拿到账号后最多等待 `server.request_timeout`；示例配置为 `4m`，追求速度时建议用更大的账号池承接 `n > 1` 的并发拆分
-- 修改 `config.yaml` 里的 `models`、`api_keys`、`accounts` 后，需要重启 sidecar
-- 当前没有实现配置热重载
+- `server.listen`、日志格式这类启动期配置仍需要重启 sidecar
 
 ## 安全提示
 

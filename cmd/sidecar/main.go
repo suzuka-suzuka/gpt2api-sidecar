@@ -50,7 +50,7 @@ func main() {
 
 	accountPool := pool.New(cfg.Accounts, minInterval)
 	imageRunner := runner.New(accountPool, cooldown429, cfg.Server.MaxImageBytes)
-	sidecarServer := server.New(cfg, accountPool, imageRunner, blobTTL)
+	sidecarServer := server.New(cfg, *configPath, accountPool, imageRunner, blobTTL)
 
 	httpServer := &http.Server{
 		Addr:              cfg.Server.Listen,

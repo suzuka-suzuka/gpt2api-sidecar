@@ -2,9 +2,11 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,6 +62,7 @@ type Result struct {
 
 type Runner struct {
 	pool         *pool.Pool
+	mu           sync.RWMutex
 	cooldown429  time.Duration
 	requestLimit int64
 }
@@ -75,6 +78,27 @@ func New(p *pool.Pool, cooldown429 time.Duration, requestLimit int64) *Runner {
 	}
 }
 
+func (r *Runner) Update(cooldown429 time.Duration, requestLimit int64) {
+	if requestLimit <= 0 {
+		requestLimit = 16 * 1024 * 1024
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cooldown429 = cooldown429
+	r.requestLimit = requestLimit
+}
+
+func (r *Runner) settings() (time.Duration, int64) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cooldown429, r.requestLimit
+}
+
+func (r *Runner) markRateLimited(accountName string) {
+	cooldown429, _ := r.settings()
+	r.pool.MarkRateLimited(accountName, cooldown429)
+}
+
 func (r *Runner) Run(ctx context.Context, req Request) *Result {
 	if req.UpstreamModel == "" {
 		req.UpstreamModel = "auto"
@@ -83,7 +107,8 @@ func (r *Runner) Run(ctx context.Context, req Request) *Result {
 		req.PollMaxWait = 5 * time.Minute
 	}
 	if req.MaxImageBytes <= 0 {
-		req.MaxImageBytes = r.requestLimit
+		_, requestLimit := r.settings()
+		req.MaxImageBytes = requestLimit
 	}
 
 	result := &Result{ErrorCode: ErrUnknown}
@@ -176,6 +201,8 @@ func (r *Runner) runConversation(
 		fileRefs     []string
 		isPreview    bool
 		inputFileIDs = uploadedFileIDSet(refs)
+		inputHashes  = referenceImageHashes(req.References)
+		isEdit       = len(req.References) > 0
 	)
 
 	cr, proofToken, code, err := r.getRequirements(ctx, client, accountName)
@@ -199,7 +226,7 @@ func (r *Runner) runConversation(
 	} else {
 		code := r.classifyUpstream(err)
 		if code == ErrRateLimited {
-			r.pool.MarkRateLimited(accountName, r.cooldown429)
+			r.markRateLimited(accountName)
 		}
 		if code == ErrAuthRequired {
 			r.pool.MarkUnauthorized(accountName)
@@ -211,7 +238,7 @@ func (r *Runner) runConversation(
 	if err != nil {
 		code := r.classifyUpstream(err)
 		if code == ErrRateLimited {
-			r.pool.MarkRateLimited(accountName, r.cooldown429)
+			r.markRateLimited(accountName)
 		}
 		if code == ErrAuthRequired {
 			r.pool.MarkUnauthorized(accountName)
@@ -229,8 +256,10 @@ func (r *Runner) runConversation(
 		zap.String("conversation_id", convID),
 		zap.Int("file_refs", len(sseResult.FileIDs)),
 		zap.Int("sediment_refs", len(sseResult.SedimentIDs)),
+		zap.Bool("image_edit", isEdit),
 	)
 
+	ignoredSedimentIDs := map[string]struct{}{}
 	for _, fid := range sseResult.FileIDs {
 		if _, isInput := inputFileIDs[fid]; isInput {
 			logger.L().Warn("ignore echoed reference image from sse",
@@ -242,14 +271,24 @@ func (r *Runner) runConversation(
 		fileRefs = append(fileRefs, fid)
 	}
 	for _, sid := range sseResult.SedimentIDs {
+		if isEdit {
+			ignoredSedimentIDs[sid] = struct{}{}
+			logger.L().Info("ignore initial sediment preview from sse for image edit",
+				zap.String("account", accountName),
+				zap.String("sediment_id", sid),
+			)
+			continue
+		}
 		fileRefs = append(fileRefs, "sed:"+sid)
 	}
 
 	if len(fileRefs) == 0 {
 		status, fids, sids := client.PollConversationForImages(ctx, convID, chatgpt.PollOpts{
-			MaxWait:       req.PollMaxWait,
-			IgnoreFileIDs: inputFileIDs,
-			ExpectedN:     1,
+			MaxWait:            req.PollMaxWait,
+			IgnoreFileIDs:      inputFileIDs,
+			IgnoreSedimentIDs:  ignoredSedimentIDs,
+			ExpectedN:          1,
+			RequireFileService: false,
 		})
 		logger.L().Info("sidecar image poll done",
 			zap.String("account", accountName),
@@ -266,6 +305,9 @@ func (r *Runner) runConversation(
 			}
 
 		case chatgpt.PollStatusTimeout:
+			if isEdit && len(sseResult.SedimentIDs) > 0 && len(fids)+len(sids) == 0 {
+				return nil, ErrPreviewOnly, errors.New("only initial sediment preview refs returned; no final image ref")
+			}
 			if ctx.Err() != nil {
 				return nil, ErrPollTimeout, fmt.Errorf("poll timeout: %w", ctx.Err())
 			}
@@ -301,6 +343,15 @@ func (r *Runner) runConversation(
 			)
 			continue
 		}
+		if isEdit {
+			if _, ok := inputHashes[sha256.Sum256(body)]; ok {
+				logger.L().Warn("skip downloaded image matching reference input",
+					zap.String("account", accountName),
+					zap.String("ref", ref),
+				)
+				continue
+			}
+		}
 
 		images = append(images, Image{
 			ContentType: contentType,
@@ -329,6 +380,17 @@ func uploadedFileIDSet(files []*chatgpt.UploadedFile) map[string]struct{} {
 	return out
 }
 
+func referenceImageHashes(references []ReferenceImage) map[[32]byte]struct{} {
+	out := make(map[[32]byte]struct{}, len(references))
+	for _, ref := range references {
+		if len(ref.Data) == 0 {
+			continue
+		}
+		out[sha256.Sum256(ref.Data)] = struct{}{}
+	}
+	return out
+}
+
 func (r *Runner) uploadReferences(
 	ctx context.Context,
 	client *chatgpt.Client,
@@ -345,7 +407,7 @@ func (r *Runner) uploadReferences(
 		if err != nil {
 			code := r.classifyUpstream(err)
 			if code == ErrRateLimited {
-				r.pool.MarkRateLimited(accountName, r.cooldown429)
+				r.markRateLimited(accountName)
 			}
 			if code == ErrAuthRequired {
 				r.pool.MarkUnauthorized(accountName)
@@ -367,7 +429,7 @@ func (r *Runner) getRequirements(
 	if err != nil {
 		code := r.classifyUpstream(err)
 		if code == ErrRateLimited {
-			r.pool.MarkRateLimited(accountName, r.cooldown429)
+			r.markRateLimited(accountName)
 		}
 		if code == ErrAuthRequired {
 			r.pool.MarkUnauthorized(accountName)

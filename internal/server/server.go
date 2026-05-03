@@ -11,10 +11,12 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -34,17 +36,40 @@ const (
 )
 
 type Server struct {
+	configPath    string
+	configModTime time.Time
+	reloadMu      sync.Mutex
+	state         atomic.Value
+	pool          *pool.Pool
+	runner        *runner.Runner
+	blobStore     *blobStore
+}
+
+type runtimeState struct {
 	cfg              *config.Config
-	pool             *pool.Pool
-	runner           *runner.Runner
 	apiKeys          map[string]struct{}
 	models           map[string]config.ModelConfig
-	blobStore        *blobStore
 	imageQueue       *queue.Gate
 	queueWaitTimeout time.Duration
 }
 
-func New(cfg *config.Config, p *pool.Pool, r *runner.Runner, blobTTL time.Duration) *Server {
+func New(cfg *config.Config, configPath string, p *pool.Pool, r *runner.Runner, blobTTL time.Duration) *Server {
+	s := &Server{
+		configPath: configPath,
+		pool:       p,
+		runner:     r,
+		blobStore:  newBlobStore(blobTTL),
+	}
+	s.state.Store(s.buildRuntimeState(cfg, nil))
+	if configPath != "" {
+		if info, err := os.Stat(configPath); err == nil {
+			s.configModTime = info.ModTime()
+		}
+	}
+	return s
+}
+
+func (s *Server) buildRuntimeState(cfg *config.Config, previous *runtimeState) *runtimeState {
 	models := make(map[string]config.ModelConfig, len(cfg.Models))
 	for _, model := range cfg.Models {
 		models[model.ID] = model
@@ -54,20 +79,85 @@ func New(cfg *config.Config, p *pool.Pool, r *runner.Runner, blobTTL time.Durati
 		apiKeys[key] = struct{}{}
 	}
 	queueWaitTimeout, _ := cfg.QueueWaitTimeoutDuration()
-	queueLimit := len(p.States())
+	queueLimit := len(s.pool.States())
 	if queueLimit <= 0 {
 		queueLimit = 1
 	}
-	return &Server{
+	imageQueue := queue.New(queueLimit, cfg.Server.MaxQueueSize)
+	if previous != nil && previous.imageQueue != nil {
+		stats := previous.imageQueue.Stats()
+		if stats.Limit == queueLimit && stats.MaxPending == cfg.Server.MaxQueueSize {
+			imageQueue = previous.imageQueue
+		}
+	}
+	return &runtimeState{
 		cfg:              cfg,
-		pool:             p,
-		runner:           r,
 		apiKeys:          apiKeys,
 		models:           models,
-		blobStore:        newBlobStore(blobTTL),
-		imageQueue:       queue.New(queueLimit, cfg.Server.MaxQueueSize),
+		imageQueue:       imageQueue,
 		queueWaitTimeout: queueWaitTimeout,
 	}
+}
+
+func (s *Server) runtime() *runtimeState {
+	return s.state.Load().(*runtimeState)
+}
+
+func (s *Server) reloadConfigIfChanged() {
+	if s.configPath == "" {
+		return
+	}
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+
+	info, err := os.Stat(s.configPath)
+	if err != nil {
+		logger.L().Warn("stat config for reload failed", zap.String("path", s.configPath), zap.Error(err))
+		return
+	}
+	if !info.ModTime().After(s.configModTime) {
+		return
+	}
+
+	cfg, err := config.Load(s.configPath)
+	if err != nil {
+		logger.L().Warn("config hot reload failed; keeping previous config",
+			zap.String("path", s.configPath),
+			zap.Error(err),
+		)
+		return
+	}
+	minInterval, err := cfg.MinIntervalDuration()
+	if err != nil {
+		logger.L().Warn("config hot reload rejected; invalid min_interval", zap.Error(err))
+		return
+	}
+	cooldown429, err := cfg.Cooldown429Duration()
+	if err != nil {
+		logger.L().Warn("config hot reload rejected; invalid cooldown_429", zap.Error(err))
+		return
+	}
+	blobTTL, err := cfg.BlobTTLDuration()
+	if err != nil {
+		logger.L().Warn("config hot reload rejected; invalid blob_ttl", zap.Error(err))
+		return
+	}
+
+	s.pool.Reload(cfg.Accounts, minInterval)
+	s.runner.Update(cooldown429, cfg.Server.MaxImageBytes)
+	s.blobStore.SetTTL(blobTTL)
+	previous := s.runtime()
+	s.state.Store(s.buildRuntimeState(cfg, previous))
+	if refreshed, statErr := os.Stat(s.configPath); statErr == nil {
+		s.configModTime = refreshed.ModTime()
+	} else {
+		s.configModTime = info.ModTime()
+	}
+	logger.L().Info("config hot reloaded",
+		zap.String("path", s.configPath),
+		zap.Int("accounts", len(cfg.Accounts)),
+		zap.Int("models", len(cfg.Models)),
+	)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -78,19 +168,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/images/generations", s.withAuth(s.handleImageGenerations))
 	mux.HandleFunc("/v1/images/edits", s.withAuth(s.handleImageEdits))
 	mux.HandleFunc("/v1/blobs/", s.handleBlob)
-	return loggingMiddleware(mux)
+	return loggingMiddleware(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		s.reloadConfigIfChanged()
+		mux.ServeHTTP(w, req)
+	}))
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	st := s.runtime()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":   "ok",
-		"models":   len(s.models),
+		"models":   len(st.models),
 		"accounts": s.pool.States(),
-		"queue":    s.imageQueue.Stats(),
+		"queue":    st.imageQueue.Stats(),
 	})
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
+	st := s.runtime()
 	type modelItem struct {
 		ID      string `json:"id"`
 		Object  string `json:"object"`
@@ -100,7 +195,7 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	firstImageModelID := func() string {
-		for _, model := range s.cfg.Models {
+		for _, model := range st.cfg.Models {
 			if model.Type == config.ModelTypeImage {
 				return model.ID
 			}
@@ -108,8 +203,8 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 		return ""
 	}
 
-	data := make([]modelItem, 0, len(s.models))
-	for _, model := range s.cfg.Models {
+	data := make([]modelItem, 0, len(st.models))
+	for _, model := range st.cfg.Models {
 		data = append(data, modelItem{
 			ID:      model.ID,
 			Object:  "model",
@@ -152,13 +247,14 @@ type imageResponse struct {
 }
 
 func (s *Server) handleImageGenerations(w http.ResponseWriter, req *http.Request) {
+	st := s.runtime()
 	var body imageGenerateRequest
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "请求体不是合法 JSON。")
 		return
 	}
 	if body.Model == "" {
-		body.Model = s.defaultImageModelID()
+		body.Model = defaultImageModelID(st.cfg)
 		if body.Model == "" {
 			writeOpenAIError(w, http.StatusBadRequest, "model_not_found", "配置中没有可用的 image 模型。")
 			return
@@ -170,7 +266,7 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	model, ok := s.models[body.Model]
+	model, ok := st.models[body.Model]
 	if !ok {
 		writeOpenAIError(w, http.StatusBadRequest, "model_not_found", fmt.Sprintf("未知模型 %q。", body.Model))
 		return
@@ -181,13 +277,13 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	refs, err := decodeReferenceInputs(req.Context(), body.ReferenceImages, s.cfg.Server.MaxImageBytes)
+	refs, err := decodeReferenceInputs(req.Context(), body.ReferenceImages, st.cfg.Server.MaxImageBytes)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_reference_image", err.Error())
 		return
 	}
 
-	items, err := s.generateImages(req.Context(), model, body.Prompt, refs, normalizeN(body.N), body.ResponseFormat)
+	items, err := s.generateImages(req.Context(), st, model, body.Prompt, refs, normalizeN(body.N), body.ResponseFormat)
 	if err != nil {
 		s.writeRunnerError(w, err)
 		return
@@ -200,20 +296,21 @@ func (s *Server) handleImageGenerations(w http.ResponseWriter, req *http.Request
 }
 
 func (s *Server) handleImageEdits(w http.ResponseWriter, req *http.Request) {
-	if err := req.ParseMultipartForm(int64(s.cfg.Server.MaxImageBytes) * int64(maxReferenceImages+1)); err != nil {
+	st := s.runtime()
+	if err := req.ParseMultipartForm(int64(st.cfg.Server.MaxImageBytes) * int64(maxReferenceImages+1)); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "解析 multipart 失败。")
 		return
 	}
 
 	modelID := req.FormValue("model")
 	if modelID == "" {
-		modelID = s.defaultImageModelID()
+		modelID = defaultImageModelID(st.cfg)
 		if modelID == "" {
 			writeOpenAIError(w, http.StatusBadRequest, "model_not_found", "配置中没有可用的 image 模型。")
 			return
 		}
 	}
-	model, ok := s.models[modelID]
+	model, ok := st.models[modelID]
 	if !ok {
 		writeOpenAIError(w, http.StatusBadRequest, "model_not_found", fmt.Sprintf("未知模型 %q。", modelID))
 		return
@@ -247,7 +344,7 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, req *http.Request) {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_reference_image", err.Error())
 			return
 		}
-		if len(data) > int(s.cfg.Server.MaxImageBytes) {
+		if len(data) > int(st.cfg.Server.MaxImageBytes) {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_reference_image",
 				fmt.Sprintf("参考图 %q 超过大小限制。", fileHeader.Filename))
 			return
@@ -258,7 +355,7 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, req *http.Request) {
 		})
 	}
 
-	items, err := s.generateImages(req.Context(), model, prompt, refs, normalizeN(parseFormInt(req.FormValue("n"), 1)), req.FormValue("response_format"))
+	items, err := s.generateImages(req.Context(), st, model, prompt, refs, normalizeN(parseFormInt(req.FormValue("n"), 1)), req.FormValue("response_format"))
 	if err != nil {
 		s.writeRunnerError(w, err)
 		return
@@ -272,13 +369,14 @@ func (s *Server) handleImageEdits(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) generateImages(
 	ctx context.Context,
+	st *runtimeState,
 	model config.ModelConfig,
 	prompt string,
 	references []runner.ReferenceImage,
 	n int,
 	responseFormat string,
 ) ([]imageResponseItem, error) {
-	queueLease, err := s.acquireImageQueue(ctx)
+	queueLease, err := s.acquireImageQueue(ctx, st)
 	if err != nil {
 		return nil, err
 	}
@@ -292,8 +390,8 @@ func (s *Server) generateImages(
 	jobsCtx, cancelJobs := context.WithCancel(ctx)
 	defer cancelJobs()
 	results := make(chan imageJobResult, jobCount)
-	requestTimeout, _ := s.cfg.RequestTimeoutDuration()
-	acquireTimeout, _ := s.cfg.AcquireTimeoutDuration()
+	requestTimeout, _ := st.cfg.RequestTimeoutDuration()
+	acquireTimeout, _ := st.cfg.AcquireTimeoutDuration()
 	taskTimeout := requestTimeout
 	if taskTimeout <= 0 {
 		taskTimeout = imageJobTimeout
@@ -307,7 +405,7 @@ func (s *Server) generateImages(
 				References:     references,
 				AcquireTimeout: acquireTimeout,
 				TaskTimeout:    taskTimeout,
-				MaxImageBytes:  s.cfg.Server.MaxImageBytes,
+				MaxImageBytes:  st.cfg.Server.MaxImageBytes,
 			})
 			if result.ErrorCode != "" {
 				code := result.ErrorCode
@@ -350,7 +448,7 @@ func (s *Server) generateImages(
 				if len(items) >= n {
 					break
 				}
-				items = append(items, s.makeImageResponseItem(image, responseFormat))
+				items = append(items, s.makeImageResponseItem(st, image, responseFormat))
 			}
 		case <-ctx.Done():
 			cancelJobs()
@@ -379,8 +477,8 @@ type imageJobResult struct {
 	ErrorMessage string
 }
 
-func (s *Server) defaultImageModelID() string {
-	for _, model := range s.cfg.Models {
+func defaultImageModelID(cfg *config.Config) string {
+	for _, model := range cfg.Models {
 		if model.Type == config.ModelTypeImage {
 			return model.ID
 		}
@@ -388,16 +486,16 @@ func (s *Server) defaultImageModelID() string {
 	return ""
 }
 
-func (s *Server) acquireImageQueue(ctx context.Context) (*queue.Lease, error) {
+func (s *Server) acquireImageQueue(ctx context.Context, st *runtimeState) (*queue.Lease, error) {
 	waitCtx := ctx
 	cancel := func() {}
-	if s.queueWaitTimeout > 0 {
-		waitCtx, cancel = context.WithTimeout(ctx, s.queueWaitTimeout)
+	if st.queueWaitTimeout > 0 {
+		waitCtx, cancel = context.WithTimeout(ctx, st.queueWaitTimeout)
 	}
 	defer cancel()
 
 	start := time.Now()
-	lease, err := s.imageQueue.Acquire(waitCtx)
+	lease, err := st.imageQueue.Acquire(waitCtx)
 	if err != nil {
 		switch {
 		case errors.Is(err, queue.ErrQueueFull):
@@ -417,7 +515,7 @@ func (s *Server) acquireImageQueue(ctx context.Context) (*queue.Lease, error) {
 
 	wait := time.Since(start)
 	if wait >= 500*time.Millisecond {
-		stats := s.imageQueue.Stats()
+		stats := st.imageQueue.Stats()
 		logger.L().Info("image queue acquired",
 			zap.Duration("wait", wait),
 			zap.Int("active", stats.Active),
@@ -428,11 +526,11 @@ func (s *Server) acquireImageQueue(ctx context.Context) (*queue.Lease, error) {
 	return lease, nil
 }
 
-func (s *Server) makeImageResponseItem(image runner.Image, responseFormat string) imageResponseItem {
+func (s *Server) makeImageResponseItem(st *runtimeState, image runner.Image, responseFormat string) imageResponseItem {
 	if strings.EqualFold(responseFormat, "url") {
 		blobID := s.blobStore.Put(image.Bytes, image.ContentType)
 		return imageResponseItem{
-			URL: strings.TrimRight(s.cfg.Server.PublicBaseURL, "/") + "/v1/blobs/" + blobID,
+			URL: strings.TrimRight(st.cfg.Server.PublicBaseURL, "/") + "/v1/blobs/" + blobID,
 		}
 	}
 
@@ -462,6 +560,7 @@ func (s *Server) handleBlob(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
+		st := s.runtime()
 		authHeader := req.Header.Get("Authorization")
 		if !strings.HasPrefix(authHeader, "Bearer ") {
 			writeOpenAIError(w, http.StatusUnauthorized, "missing_api_key", "缺少 Bearer API Key。")
@@ -469,7 +568,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		apiKey := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
-		if _, ok := s.apiKeys[apiKey]; !ok {
+		if _, ok := st.apiKeys[apiKey]; !ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "API Key 无效。")
 			return
 		}
@@ -773,6 +872,13 @@ func (b *blobStore) Put(data []byte, contentType string) string {
 		ExpiresAt:   time.Now().Add(b.ttl),
 	}
 	return id
+}
+
+func (b *blobStore) SetTTL(ttl time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ttl = ttl
+	b.gcLocked()
 }
 
 func (b *blobStore) Get(id string) (blobItem, bool) {

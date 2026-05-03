@@ -73,16 +73,65 @@ func New(accounts []config.AccountConfig, minInterval time.Duration) *Pool {
 	}
 }
 
-func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
-	if len(p.accounts) == 0 {
-		return nil, ErrNoAvailable
+func (p *Pool) Reload(accounts []config.AccountConfig, minInterval time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	existing := make(map[string]*account, len(p.accounts))
+	for _, acc := range p.accounts {
+		if acc == nil {
+			continue
+		}
+		existing[acc.snapshot.Name] = acc
 	}
 
+	items := make([]*account, 0, len(accounts))
+	for _, cfg := range accounts {
+		if cfg.Enabled != nil && !*cfg.Enabled {
+			continue
+		}
+		snap := Snapshot{
+			Name:      cfg.Name,
+			AuthToken: cfg.AuthToken,
+			DeviceID:  cfg.DeviceID,
+			SessionID: cfg.SessionID,
+			ProxyURL:  cfg.ProxyURL,
+			Cookies:   cfg.Cookies,
+		}
+		if acc, ok := existing[cfg.Name]; ok {
+			authChanged := acc.snapshot.AuthToken != snap.AuthToken ||
+				acc.snapshot.DeviceID != snap.DeviceID ||
+				acc.snapshot.SessionID != snap.SessionID ||
+				acc.snapshot.ProxyURL != snap.ProxyURL ||
+				acc.snapshot.Cookies != snap.Cookies
+			acc.snapshot = snap
+			if authChanged {
+				acc.disabled = false
+				acc.cooldownUntil = time.Time{}
+			}
+			items = append(items, acc)
+			continue
+		}
+		items = append(items, &account{snapshot: snap})
+	}
+
+	p.accounts = items
+	p.minInterval = minInterval
+	if len(p.accounts) == 0 || p.nextIndex >= len(p.accounts) {
+		p.nextIndex = 0
+	}
+}
+
+func (p *Pool) Acquire(ctx context.Context) (*Lease, error) {
 	backoff := 200 * time.Millisecond
 	for {
 		now := time.Now()
 
 		p.mu.Lock()
+		if len(p.accounts) == 0 {
+			p.mu.Unlock()
+			return nil, ErrNoAvailable
+		}
 		for i := 0; i < len(p.accounts); i++ {
 			idx := (p.nextIndex + i) % len(p.accounts)
 			acc := p.accounts[idx]

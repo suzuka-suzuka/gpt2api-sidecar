@@ -503,11 +503,13 @@ func ExtractImageToolMsgs(mapping map[string]interface{}) []ImageToolMsg {
 //   - 没够数继续轮询,到 MaxWait 仍有至少 1 张也算成功(速度优先)
 //   - 全程没拿到图才是 timeout
 type PollOpts struct {
-	BaselineToolIDs map[string]struct{} // 发送前已存在的 tool 消息 id,本次回合只看新增
-	IgnoreFileIDs   map[string]struct{} // 已知不是本轮输出的 file-service id,例如图生图输入参考图
-	ExpectedN       int                 // 期望返回的图片张数,够了立即短路,默认 1
-	MaxWait         time.Duration       // 总超时,默认 300s(上游渲染慢时兜底补齐)
-	Interval        time.Duration       // 轮询间隔,默认 3s
+	BaselineToolIDs    map[string]struct{} // 发送前已存在的 tool 消息 id,本次回合只看新增
+	IgnoreFileIDs      map[string]struct{} // 已知不是本轮输出的 file-service id,例如图生图输入参考图
+	IgnoreSedimentIDs  map[string]struct{} // 已知不是本轮输出的 sediment id,例如 SSE 早期回显预览
+	ExpectedN          int                 // 期望返回的图片张数,够了立即短路,默认 1
+	RequireFileService bool                // 为 true 时只把 file-service 终稿算成功,sediment 只作为预览线索
+	MaxWait            time.Duration       // 总超时,默认 300s(上游渲染慢时兜底补齐)
+	Interval           time.Duration       // 轮询间隔,默认 3s
 }
 
 // PollStatus 是 PollConversationForImages 的结果状态。
@@ -535,6 +537,7 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 	}
 	baseline := opt.BaselineToolIDs
 	ignoreFile := opt.IgnoreFileIDs
+	ignoreSed := opt.IgnoreSedimentIDs
 
 	deadline := time.Now().Add(opt.MaxWait)
 
@@ -550,13 +553,13 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			if len(allFile)+len(allSed) > 0 {
+			if len(allFile) > 0 || (!opt.RequireFileService && len(allFile)+len(allSed) > 0) {
 				return PollStatusSuccess, allFile, allSed
 			}
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return PollStatusTimeout, nil, nil
+				return PollStatusTimeout, allFile, allSed
 			}
-			return PollStatusError, nil, nil
+			return PollStatusError, allFile, allSed
 		default:
 		}
 
@@ -602,6 +605,9 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 				}
 			}
 			for _, s := range m.SedimentIDs {
+				if _, ignored := ignoreSed[s]; ignored {
+					continue
+				}
 				if _, ok := seenSed[s]; !ok {
 					seenSed[s] = struct{}{}
 					allSed = append(allSed, s)
@@ -609,8 +615,13 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 			}
 		}
 
-		// 够 N 张立即短路返回(file-service 优先占配额,sediment 补位)
-		if len(allFile)+len(allSed) >= opt.ExpectedN {
+		// 够 N 张立即短路返回。编辑/图生图场景可以要求等 file-service 终稿,
+		// 避免把上游先回显的 sediment 预览/附件当成结果。
+		enough := len(allFile)+len(allSed) >= opt.ExpectedN
+		if opt.RequireFileService {
+			enough = len(allFile) >= opt.ExpectedN
+		}
+		if enough {
 			return PollStatusSuccess, allFile, allSed
 		}
 
@@ -618,10 +629,10 @@ func (c *Client) PollConversationForImages(ctx context.Context, convID string, o
 	}
 
 	// 超时兜底:只要拿到过至少 1 张,就算成功(速度优先,不等齐 N)
-	if len(allFile)+len(allSed) > 0 {
+	if len(allFile) > 0 || (!opt.RequireFileService && len(allFile)+len(allSed) > 0) {
 		return PollStatusSuccess, allFile, allSed
 	}
-	return PollStatusTimeout, nil, nil
+	return PollStatusTimeout, allFile, allSed
 }
 
 // getMappingRaw 拉 conversation 并返回 mapping。
